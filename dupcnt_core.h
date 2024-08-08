@@ -14,9 +14,9 @@
  * If trie is oversized, some nodes and paths will be removed to restrict memory usage.
  **/
 
-#define TRIE_SHIFT 6
-#define TRIE_BATCH 4096
-#define TRIE_SIZE  1953125
+#define TRIE_SHIFT  6
+#define TRIE_BATCH  4096
+#define TRIE_SIZE1  1953125
 
 struct TrNode {
 	// x[c] = 0 suggest no child down from branch c
@@ -29,8 +29,8 @@ private:
 	std::vector<TrNode> nodes; /** Nodes in the trie */
 
 public:
-	int reads_n = 0;
-	int unique_n = 0;
+	int64_t reads_n = 0;
+	int64_t unique_n = 0;
 	/** Construction: init root node */
 	Trie();
 
@@ -44,6 +44,6 @@ public:
 	void stat();
 };
 
-void process(int n_threads, int n_sample, char *files[]);
+void process(int n_threads, const char *index_prefix, int n_sample, char *files[]);
 
 #endif //DUPCNT_DEDUP_CORE_H

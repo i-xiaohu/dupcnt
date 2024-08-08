@@ -20,7 +20,7 @@ int main(int argc, char *argv[]) {
 		return usage();
 	}
 	int c, threads_n = 16;
-	char *index_prefix;
+	char *index_prefix = nullptr;
 	while ((c = getopt(argc, argv, "t:i:")) >= 0) {
 		if (c == 't') {
 			threads_n = atoi(optarg);
@@ -29,8 +29,13 @@ int main(int argc, char *argv[]) {
 		}
 	}
 
+	if (index_prefix == nullptr) {
+		fprintf(stderr, "Please provide index file\n");
+		return 1;
+	}
+
 	fprintf(stderr, "%d samples to process\n", argc - optind);
-	process(threads_n, argc - optind, argv + optind);
+	process(threads_n, index_prefix, argc - optind, argv + optind);
 
 	return 0;
 }
