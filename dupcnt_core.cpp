@@ -16,6 +16,9 @@
 char inbuf[MAX_LINE];
 int read_length_monitor = -1; // To avoid any read of different length
 
+#include "bwalib/kseq.h"
+KSEQ_INIT(gzFile, gzread)
+
 std::vector<std::string> input_reads(gzFile fp, int batch_size) {
 	int bases_n = 0;
 	std::vector<std::string> ret;
@@ -45,14 +48,7 @@ void Trie::add_read(int n, const char *s) {
 	reads_n += 1;
 	int32_t p = 0;
 	for (int i = 0; i < n; i++) {
-		uint8_t c;
-		switch (s[i]) {
-			case 'A': c = 0; break;
-			case 'C': c = 1; break;
-			case 'G': c = 2; break;
-			case 'T': c = 3; break;
-			default: c = 0; break;
-		}
+		uint8_t c = s[i];
 		if (nodes[p].x[c] == 0) { // No child
 			nodes[p].x[c] = nodes.size();
 			nodes.emplace_back(TrNode());
@@ -104,7 +100,7 @@ void Trie::stat() {
 	std::reverse(rep_read.begin(), rep_read.end());
 	fprintf(stderr, "The most repetitive read occurs %d times:\n", max_occ);
 	fprintf(stderr, "%s\n", rep_read.c_str());
-	fprintf(stderr, "%d unique reads in %d reads\n", unique_n, reads_n);
+	fprintf(stderr, "%ld unique reads in %ld reads\n", unique_n, reads_n);
 }
 
 double realtime()
@@ -115,19 +111,24 @@ double realtime()
 	return tp.tv_sec + tp.tv_usec * 1e-6;
 }
 
-std::vector<std::string> exact_matching(const bwaidx_t *idx, const std::vector<std::string> &seqs, int32_t *em_counter) {
-	std::vector<std::string> ret;
-	auto *b = (uint8_t*) malloc(read_length_monitor * sizeof(uint8_t));
-	for (const auto &s : seqs) {
-		for (int i = 0; i < read_length_monitor; i++) {
-			b[i] = nst_nt4_table[(uint8_t)s[i]];
-			assert(b[i] < 4);
-		}
+static inline void bseq1_destroy(const bseq1_t *b) {
+	free(b->name);
+	free(b->comment);
+	free(b->seq);
+	free(b->qual);
+}
+
+int exact_matching(const bwaidx_t *idx, int n, bseq1_t *seqs, int32_t *em_counter) {
+	std::vector<bseq1_t> ret;
+	int not_match_n = 0;
+	for (int i = 0; i < n; i++) {
+		bseq1_t *b = &seqs[i];
+		auto *s = (uint8_t*)seqs[i].seq;
 		bwtintv_t ik, ok[4];
-		bwt_set_intv(idx->bwt, b[0], ik);
-		for (int i = 1; i < read_length_monitor; i++) {
+		bwt_set_intv(idx->bwt, s[0], ik);
+		for (int j = 1; j < b->l_seq; j++) {
 			bwt_extend(idx->bwt, &ik, ok, 0);
-			ik = ok[3 - b[i]];
+			ik = ok[3 - s[j]];
 			if (ik.x[2] == 0) {
 				break;
 			}
@@ -136,12 +137,12 @@ std::vector<std::string> exact_matching(const bwaidx_t *idx, const std::vector<s
 			// Use the first occurrence in suffix array
 			int64_t x = bwt_sa(idx->bwt, ik.x[0]);
 			em_counter[x]++;
+			bseq1_destroy(&seqs[i]);
 		} else {
-			ret.push_back(s);
+			seqs[not_match_n++] = seqs[i];
 		}
 	}
-	free(b);
-	return ret;
+	return not_match_n;
 }
 
 void process(int n_threads, const char *index_prefix, int n_sample, char *files[]) {
@@ -167,39 +168,45 @@ void process(int n_threads, const char *index_prefix, int n_sample, char *files[
 			continue;
 		}
 		double t_input = 0, t_match = 0, t_trie = 0;
-		int64_t n_seqs = 0, n_match = 0;
-		std::vector<std::string> seqs;
+		int total_seqs = 0, n_seqs = 0, n_match = 0;
+		kseq_t *ks = kseq_init(fp);
+		bseq1_t *seqs;
 		Trie counter;
-		while (true) {
-			t_start = realtime();
-			seqs = input_reads(fp, actual_batch_size);
-			t_end = realtime();
-			t_input += t_end - t_start;
-			if (seqs.empty()) break;
-			// Convert non-ACGT to A
-			for (auto &r : seqs) {
-				for (auto &c : r) {
-					if (c == 'N') c = 'A';
+		while ((seqs = bseq_read(actual_batch_size, &n_seqs, ks, nullptr))) {
+			total_seqs += n_seqs;
+			for (int j = 0; j < n_seqs; j++) {
+				bseq1_t *b = &seqs[j];
+				if (read_length_monitor == -1) read_length_monitor = b->l_seq;
+				if (read_length_monitor != b->l_seq) {
+					fprintf(stderr, "Only fix-length reads are supported\n");
+					std::abort();
+				}
+				for (int k = 0; k < b->l_seq; k++) {
+					b->seq[k] = nst_nt4_table[(uint8_t)b->seq[k]];
+					// Convert non-ACGT to A
+					if (b->seq[k] > 3) b->seq[k] = 0;
 				}
 			}
-			n_seqs += seqs.size();
 
 			// 1. Identify exactly matched reads
 			t_start = realtime();
-			auto rest = exact_matching(idx, seqs, em_counter);
+			int n_rest = exact_matching(idx, n_seqs, seqs, em_counter);
 			t_end = realtime();
 			t_match += t_end - t_start;
-			fprintf(stderr, "%.2f %% matched reads\n", 100.0 * (double)(seqs.size() - rest.size()) / seqs.size());
-			n_match += seqs.size() - rest.size();
+			fprintf(stderr, "%.2f %% matched reads\n", 100.0 * (double)(n_seqs - n_rest) / n_seqs);
+			n_match += n_seqs - n_rest;
 
 			// 2. Process unmatched reads using trie
 			// todo: trie is slower than sorting
 			t_start = realtime();
-			for (auto &r : rest) {
-				counter.add_read(r.length(), r.c_str());
+			for (int j = 0; j < n_rest; j++) {
+				bseq1_t *b = &seqs[j];
+				counter.add_read(b->l_seq, b->seq);
+				bseq1_destroy(b);
 			}
 			t_end = realtime();
 			t_trie += t_end - t_start;
+			free(seqs);
 		}
 
 		t_start = realtime();
@@ -207,7 +214,7 @@ void process(int n_threads, const char *index_prefix, int n_sample, char *files[
 		t_end = realtime();
 
 		fprintf(stderr, "Input: %.2f s, Match: %.2f s, Trie: %.2f s, Post: %.2f s\n", t_input, t_match, t_trie, t_end - t_start);
-		fprintf(stderr, "Exactly matched reads: %ld (%.2f %%)\n", n_match, 100.0 * n_match / n_seqs);
+		fprintf(stderr, "Exactly matched reads: %d (%.2f %%)\n", n_match, 100.0 * n_match / n_seqs);
 
 		int max_occ = 0;
 		int64_t max_pos = -1;
