@@ -19,6 +19,7 @@ int read_length_monitor = -1; // To avoid any read of different length
 KSEQ_INIT(gzFile, gzread)
 
 Trie::Trie() {
+	unique_n = 0;
 	nodes.clear();
 	nodes.emplace_back(TrNode());
 }
@@ -115,6 +116,7 @@ typedef struct {
 void trie_insert(void *_data, long bucket_id, int t_id) {
 	auto *w = (worker2_t*)_data;
 	Trie *trie_counter = w->trie_counter[bucket_id];
+	trie_counter->unique_n = 0; // Reset to calculate unique reads added
 	for (int i = 0; i < w->n_rest; i++) {
 		const bseq1_t *b = &w->seqs[i];
 		uint32_t prefix = 0;
@@ -144,6 +146,9 @@ typedef struct {
 
 	// Time profiler
 	double t_input, t_match, t_trie;
+
+	// Brute-force validation
+	std::vector<std::string> reads;
 } ktp_aux_t;
 
 typedef struct {
@@ -164,6 +169,7 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 			free(ret);
 			return 0;
 		}
+		std::string read;
 		for (int i = 0; i < ret->n_seqs; i++) {
 			bseq1_t *b = &ret->seqs[i];
 			// Check read length
@@ -172,11 +178,14 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 				fprintf(stderr, "Only fix-length reads are supported\n");
 				std::abort();
 			}
+			if (read.empty()) read.resize(read_length_monitor);
 			// Convert non-ACGT to A
 			for (int k = 0; k < b->l_seq; k++) {
 				b->seq[k] = nst_nt4_table[(uint8_t)b->seq[k]];
 				if (b->seq[k] > 3) b->seq[k] = 0;
+				read[k] = "ACGT"[b->seq[k]];
 			}
+			aux->reads.push_back(read);
 		}
 		aux->t_input = realtime() - t_start;
 		return ret;
@@ -265,6 +274,15 @@ void process(int n_threads, const char *index_prefix, int n_sample, char *files[
 		aux.ks = kseq_init(fp);
 
 		kt_pipeline(2, dual_pipeline, &aux, 2);
+
+		std::sort(aux.reads.begin(), aux.reads.end());
+		int n = 1;
+		for (int j = 1; j < aux.reads.size(); j++) {
+			if (aux.reads[j-1] != aux.reads[j]) {
+				n++;
+			}
+		}
+		fprintf(stderr, "%d\n", n);
 
 		fprintf(stderr, "%d sample(s) processed\n", i + 1);
 		fprintf(stderr, "  Time profile(s):       input %.2f; Match %.2f; Trie %.2f; Post %.2f\n", aux.t_input, aux.t_match, aux.t_trie, t_end - t_start);

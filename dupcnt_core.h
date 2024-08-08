@@ -29,7 +29,7 @@ private:
 	std::vector<TrNode> nodes; /** Nodes in the trie */
 
 public:
-	int unique_n = 0; // Number of reads that have no identical match in the trie
+	int unique_n; // Number of reads that have no identical match in the trie
 
 	/** Construction: init root node */
 	Trie();
