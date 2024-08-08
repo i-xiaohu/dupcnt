@@ -14,9 +14,9 @@
  * If trie is oversized, some nodes and paths will be removed to restrict memory usage.
  **/
 
-#define TRIE_SHIFT  6
-#define TRIE_BATCH  4096
-#define TRIE_SIZE1  1953125
+#define TRIE_SHIFT        6
+#define TRIE_BUCKET_SIZE  4096
+#define TRIE_SIZE_CAP     1953125
 
 struct TrNode {
 	// x[c] = 0 suggest no child down from branch c
@@ -29,8 +29,8 @@ private:
 	std::vector<TrNode> nodes; /** Nodes in the trie */
 
 public:
-	int64_t reads_n = 0;
-	int64_t unique_n = 0;
+	int unique_n = 0;
+
 	/** Construction: init root node */
 	Trie();
 
@@ -41,7 +41,8 @@ public:
 	 */
 	void add_read(int n, const char *s);
 
-	void stat();
+	/** Return unique reads in the trie */
+	int count_unique();
 };
 
 void process(int n_threads, const char *index_prefix, int n_sample, char *files[]);
