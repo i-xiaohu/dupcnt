@@ -13,32 +13,10 @@
 #include "bwalib/bwa.h"
 #include "cstl/kthread.h"
 
-#define MAX_LINE 10240
-char inbuf[MAX_LINE];
 int read_length_monitor = -1; // To avoid any read of different length
 
 #include "bwalib/kseq.h"
 KSEQ_INIT(gzFile, gzread)
-
-std::vector<std::string> input_reads(gzFile fp, int batch_size) {
-	int bases_n = 0;
-	std::vector<std::string> ret;
-	while (gzgets(fp, inbuf, MAX_LINE)) {
-		gzgets(fp, inbuf, MAX_LINE);
-		int len = strlen(inbuf);
-		inbuf[--len] = '\0';
-		ret.emplace_back(std::string(inbuf));
-		gzgets(fp, inbuf, MAX_LINE);
-		gzgets(fp, inbuf, MAX_LINE);
-		if (read_length_monitor == -1) read_length_monitor = len;
-		else assert(read_length_monitor == len);
-		bases_n += len;
-		if (bases_n > batch_size) {
-			break;
-		}
-	}
-	return ret;
-}
 
 Trie::Trie() {
 	nodes.clear();
@@ -56,14 +34,15 @@ void Trie::add_read(int n, const char *s) {
 		p = nodes[p].x[c]; // Move down to the next layer
 	}
 	// Remember x[0] is initialized as 0 thus can be used to track the occurrence number by +1
+	if (nodes[p].x[0] == 0) unique_n++;
 	nodes[p].x[0]++;
 }
 
-int Trie::count_unique() {
-	int32_t p = 0;
+int Trie::get_max_occ() {
+	int32_t p = 0, ret = 0;
 	std::vector<int> prev, curr;
 	prev.push_back(p);
-	for (int i = 0; i < read_length_monitor; i++) {
+	for (int i = TRIE_SHIFT; i < read_length_monitor; i++) {
 		curr.clear();
 		for (int t : prev) {
 			for (int k : nodes[t].x) {
@@ -74,7 +53,12 @@ int Trie::count_unique() {
 		}
 		std::swap(prev, curr);
 	}
-	return prev.size(); // Leaves are those unique reads
+	for (auto k : prev) {
+		if (nodes[k].x[0] > ret) {
+			ret = nodes[k].x[0];
+		}
+	}
+	return ret;
 }
 
 double realtime()
@@ -153,8 +137,10 @@ typedef struct {
 	int n_threads;
 	int64_t n_sample_seqs;
 	int64_t n_matched_seqs;
+	int64_t n_unique; // Number of left reads in all samples after deduplication
 	Trie **trie_counter;
 	int32_t *em_counter;
+	int32_t max_occ; // Occurrence number of most repetitive reads
 
 	// Time profiler
 	double t_input, t_match, t_trie;
@@ -208,7 +194,9 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 		for (int i = 0; i < data->n_seqs; i++) {
 			int64_t pos = w1.match_pos[i];
 			if (pos != -1) {
+				if (aux->em_counter[pos] == 0) aux->n_unique++;
 				aux->em_counter[pos]++;
+				aux->max_occ = std::max(aux->max_occ, aux->em_counter[pos]);
 			} else {
 				data->seqs[n_rest++] = data->seqs[i];
 			}
@@ -228,6 +216,10 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 		w2.trie_counter = aux->trie_counter;
 		kt_for(aux->n_threads, trie_insert, &w2, TRIE_BUCKET_SIZE);
 		for (int i = 0; i < n_rest; i++) bseq1_destroy(&data->seqs[i]);
+		for (int i = 0; i < TRIE_BUCKET_SIZE; i++) {
+			aux->n_unique += aux->trie_counter[i]->unique_n;
+			aux->max_occ = std::max(aux->max_occ, aux->trie_counter[i]->get_max_occ());
+		}
 		t_end = realtime();
 		aux->t_trie += t_end - t_start;
 		free(data->seqs);
@@ -255,6 +247,10 @@ void process(int n_threads, const char *index_prefix, int n_sample, char *files[
 	aux.idx = idx;
 	aux.actual_chunk_size = n_threads * BATCH_SIZE;
 	aux.n_threads = n_threads;
+	aux.n_sample_seqs = 0;
+	aux.n_matched_seqs = 0;
+	aux.n_unique = 0;
+	aux.max_occ = 0;
 	aux.em_counter = (int32_t*) calloc(ref_len, sizeof(int32_t));
 	aux.trie_counter = new Trie*[BATCH_SIZE];
 	for (int i = 0; i < TRIE_BUCKET_SIZE; i++) aux.trie_counter[i] = new Trie();
@@ -267,27 +263,16 @@ void process(int n_threads, const char *index_prefix, int n_sample, char *files[
 		}
 		aux.t_input = aux.t_match = aux.t_trie = 0;
 		aux.ks = kseq_init(fp);
-		aux.n_sample_seqs = 0;
-		aux.n_matched_seqs = 0;
 
 		kt_pipeline(2, dual_pipeline, &aux, 2);
 
-		t_start = realtime();
-//		aux.trie_counter->stat();
-		t_end = realtime();
-
-		fprintf(stderr, "Input: %.2f s, Match: %.2f s, Trie: %.2f s, Post: %.2f s\n", aux.t_input, aux.t_match, aux.t_trie, t_end - t_start);
-		fprintf(stderr, "Exactly matched reads: %ld (%.2f %%)\n", aux.n_matched_seqs, 100.0 * aux.n_matched_seqs / aux.n_sample_seqs);
-
-		int max_occ = 0;
-		int64_t max_pos = -1;
-		for (int64_t j = 0; j < ref_len; j++) {
-			if (aux.em_counter[j] > max_occ) {
-				max_occ = aux.em_counter[j];
-				max_pos = j;
-			}
-		}
-		fprintf(stderr, "Read matched at %ld occurs %d times\n", max_pos, max_occ);
+		fprintf(stderr, "%d sample(s) processed\n", i + 1);
+		fprintf(stderr, "  Time profile(s):       input %.2f; Match %.2f; Trie %.2f; Post %.2f\n", aux.t_input, aux.t_match, aux.t_trie, t_end - t_start);
+		fprintf(stderr, "  Number of reads:       %ld\n", aux.n_sample_seqs);
+		fprintf(stderr, "  Exactly matched reads: %ld (%.2f %%)\n", aux.n_matched_seqs, 100.0 * aux.n_matched_seqs / aux.n_sample_seqs);
+		fprintf(stderr, "  Unique reads:          %ld (%.2f %%)\n", aux.n_unique, 100.0 * aux.n_unique / aux.n_sample_seqs);
+		fprintf(stderr, "  Max occurrence:        %d\n", aux.max_occ);
+		fprintf(stderr, "\n");
 	}
 
 	free(aux.em_counter);

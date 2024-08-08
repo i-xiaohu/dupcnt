@@ -29,7 +29,7 @@ private:
 	std::vector<TrNode> nodes; /** Nodes in the trie */
 
 public:
-	int unique_n = 0;
+	int unique_n = 0; // Number of reads that have no identical match in the trie
 
 	/** Construction: init root node */
 	Trie();
@@ -41,8 +41,7 @@ public:
 	 */
 	void add_read(int n, const char *s);
 
-	/** Return unique reads in the trie */
-	int count_unique();
+	int get_max_occ();
 };
 
 void process(int n_threads, const char *index_prefix, int n_sample, char *files[]);
