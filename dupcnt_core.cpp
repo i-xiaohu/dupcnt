@@ -11,6 +11,7 @@
 #include <algorithm>
 #include "dupcnt_core.h"
 #include "bwalib/bwa.h"
+#include "cstl/kthread.h"
 
 #define MAX_LINE 10240
 char inbuf[MAX_LINE];
@@ -145,6 +146,83 @@ int exact_matching(const bwaidx_t *idx, int n, bseq1_t *seqs, int32_t *em_counte
 	return not_match_n;
 }
 
+/** Parallelism over I/O and processing */
+typedef struct {
+	bwaidx_t *idx;
+	kseq_t *ks;
+	int actual_chunk_size;
+	int n_threads;
+	int64_t n_sample_seqs;
+	int64_t n_matched_seqs;
+	Trie *trie_counter;
+	int32_t *em_counter;
+
+	// Time profiler
+	double t_input, t_match, t_trie;
+} ktp_aux_t;
+
+typedef struct {
+	ktp_aux_t *aux;
+	int n_seqs;
+	bseq1_t *seqs;
+} ktp_data_t;
+
+static void *dual_pipeline(void *shared, int step, void *_data) {
+	double t_start, t_end;
+	auto *aux = (ktp_aux_t*)shared;
+	auto *data = (ktp_data_t*)_data;
+	if (step == 0) { // Input
+		t_start = realtime();
+		auto *ret = (ktp_data_t*) calloc(1, sizeof(ktp_data_t));
+		ret->seqs = bseq_read(aux->actual_chunk_size, &ret->n_seqs, aux->ks, nullptr);
+		if (ret->seqs == 0) {
+			free(ret);
+			return 0;
+		}
+		for (int i = 0; i < ret->n_seqs; i++) {
+			bseq1_t *b = &ret->seqs[i];
+			// Check read length
+			if (read_length_monitor == -1) read_length_monitor = b->l_seq;
+			if (read_length_monitor != b->l_seq) {
+				fprintf(stderr, "Only fix-length reads are supported\n");
+				std::abort();
+			}
+			// Convert non-ACGT to A
+			for (int k = 0; k < b->l_seq; k++) {
+				b->seq[k] = nst_nt4_table[(uint8_t)b->seq[k]];
+				if (b->seq[k] > 3) b->seq[k] = 0;
+			}
+		}
+		aux->t_input = realtime() - t_start;
+		return ret;
+	}
+	else if (step == 1) { // Process
+		const bwaidx_t *idx = aux->idx;
+		aux->n_sample_seqs += data->n_seqs;
+		// 1. Identify exactly matched reads
+		t_start = realtime();
+		int n_rest = exact_matching(idx, data->n_seqs, data->seqs, aux->em_counter);
+		aux->n_matched_seqs += data->n_seqs - n_rest;
+		t_end = realtime();
+		aux->t_match += t_end - t_start;
+		fprintf(stderr, "%.2f %% matched reads\n", 100.0 * (double)(data->n_seqs - n_rest) / data->n_seqs);
+
+		// 2. Process unmatched reads using trie
+		// todo: trie is slower than sorting
+		t_start = realtime();
+		for (int j = 0; j < n_rest; j++) {
+			bseq1_t *b = &data->seqs[j];
+			aux->trie_counter->add_read(b->l_seq, b->seq);
+			bseq1_destroy(b);
+		}
+		t_end = realtime();
+		aux->t_trie += t_end - t_start;
+		free(data->seqs);
+		return 0;
+	}
+	return 0;
+}
+
 void process(int n_threads, const char *index_prefix, int n_sample, char *files[]) {
 	double t_start, t_end;
 	/* FM-index from BWA-MEM; todo: do consider switch to BWA-MEM2 index */
@@ -157,75 +235,46 @@ void process(int n_threads, const char *index_prefix, int n_sample, char *files[
 	}
 	int64_t ref_len = idx->bns->l_pac * 2;
 	fprintf(stderr, "Reference length: %ld\n", ref_len);
-	auto *em_counter = (int32_t*) calloc(ref_len, sizeof(int32_t));
 
+	ktp_aux_t aux;
 	const int BATCH_SIZE = 10 * 1000 * 1000; // 10M bases for each thread
-	int actual_batch_size = n_threads * BATCH_SIZE;
+	aux.idx = idx;
+	aux.actual_chunk_size = n_threads * BATCH_SIZE;
+	aux.n_threads = n_threads;
+	aux.em_counter = (int32_t*) calloc(ref_len, sizeof(int32_t));
+	aux.trie_counter = new Trie();
+
 	for (int i = 0; i < n_sample; i++) {
 		gzFile fp = gzopen(files[i], "r");
 		if (fp == nullptr) {
-			fprintf(stderr, "Open `%s` failed\n", files[i]);
+			fprintf(stderr, "Open FASTA file `%s` failed\n", files[i]);
 			continue;
 		}
-		double t_input = 0, t_match = 0, t_trie = 0;
-		int total_seqs = 0, n_seqs = 0, n_match = 0;
-		kseq_t *ks = kseq_init(fp);
-		bseq1_t *seqs;
-		Trie counter;
-		while ((seqs = bseq_read(actual_batch_size, &n_seqs, ks, nullptr))) {
-			total_seqs += n_seqs;
-			for (int j = 0; j < n_seqs; j++) {
-				bseq1_t *b = &seqs[j];
-				if (read_length_monitor == -1) read_length_monitor = b->l_seq;
-				if (read_length_monitor != b->l_seq) {
-					fprintf(stderr, "Only fix-length reads are supported\n");
-					std::abort();
-				}
-				for (int k = 0; k < b->l_seq; k++) {
-					b->seq[k] = nst_nt4_table[(uint8_t)b->seq[k]];
-					// Convert non-ACGT to A
-					if (b->seq[k] > 3) b->seq[k] = 0;
-				}
-			}
+		aux.t_input = aux.t_match = aux.t_trie = 0;
+		aux.ks = kseq_init(fp);
+		aux.n_sample_seqs = 0;
+		aux.n_matched_seqs = 0;
 
-			// 1. Identify exactly matched reads
-			t_start = realtime();
-			int n_rest = exact_matching(idx, n_seqs, seqs, em_counter);
-			t_end = realtime();
-			t_match += t_end - t_start;
-			fprintf(stderr, "%.2f %% matched reads\n", 100.0 * (double)(n_seqs - n_rest) / n_seqs);
-			n_match += n_seqs - n_rest;
-
-			// 2. Process unmatched reads using trie
-			// todo: trie is slower than sorting
-			t_start = realtime();
-			for (int j = 0; j < n_rest; j++) {
-				bseq1_t *b = &seqs[j];
-				counter.add_read(b->l_seq, b->seq);
-				bseq1_destroy(b);
-			}
-			t_end = realtime();
-			t_trie += t_end - t_start;
-			free(seqs);
-		}
+		kt_pipeline(2, dual_pipeline, &aux, 2);
 
 		t_start = realtime();
-		counter.stat();
+		aux.trie_counter->stat();
 		t_end = realtime();
 
-		fprintf(stderr, "Input: %.2f s, Match: %.2f s, Trie: %.2f s, Post: %.2f s\n", t_input, t_match, t_trie, t_end - t_start);
-		fprintf(stderr, "Exactly matched reads: %d (%.2f %%)\n", n_match, 100.0 * n_match / n_seqs);
+		fprintf(stderr, "Input: %.2f s, Match: %.2f s, Trie: %.2f s, Post: %.2f s\n", aux.t_input, aux.t_match, aux.t_trie, t_end - t_start);
+		fprintf(stderr, "Exactly matched reads: %ld (%.2f %%)\n", aux.n_matched_seqs, 100.0 * aux.n_matched_seqs / aux.n_sample_seqs);
 
 		int max_occ = 0;
 		int64_t max_pos = -1;
 		for (int64_t j = 0; j < ref_len; j++) {
-			if (em_counter[j] > max_occ) {
-				max_occ = em_counter[j];
+			if (aux.em_counter[j] > max_occ) {
+				max_occ = aux.em_counter[j];
 				max_pos = j;
 			}
 		}
 		fprintf(stderr, "Read matched at %ld occurs %d times\n", max_pos, max_occ);
 	}
 
-	free(em_counter);
+	free(aux.em_counter);
+	delete aux.trie_counter;
 }

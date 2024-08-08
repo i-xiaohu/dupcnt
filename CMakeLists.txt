@@ -5,6 +5,14 @@ set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -O3")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O3")
 
+set(cstl
+        cstl/kvec.h
+        cstl/khash.h
+        cstl/ksort.h
+        cstl/kbtree.h
+        cstl/kstring.c cstl/kstring.h
+        cstl/kthread.c cstl/kthread.h)
+
 set(FM_index
         FM_index/bntseq.c FM_index/bntseq.h
         FM_index/bwt.c FM_index/bwt.h
@@ -28,7 +36,8 @@ target_link_libraries(bwaidx -lz -lrt)
 add_executable(dupcnt
         ${FM_index}
         ${bwalib}
+        ${cstl}
         dupcnt_core.cpp
         dupcnt_core.h
         main.cpp )
-target_link_libraries(dupcnt -lz -lrt)
+target_link_libraries(dupcnt -lz -lrt -lpthread)
