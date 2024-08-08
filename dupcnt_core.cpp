@@ -119,32 +119,36 @@ static inline void bseq1_destroy(const bseq1_t *b) {
 	free(b->qual);
 }
 
-int exact_matching(const bwaidx_t *idx, int n, bseq1_t *seqs, int32_t *em_counter) {
-	std::vector<bseq1_t> ret;
-	int not_match_n = 0;
-	for (int i = 0; i < n; i++) {
-		bseq1_t *b = &seqs[i];
-		auto *s = (uint8_t*)seqs[i].seq;
-		bwtintv_t ik, ok[4];
-		bwt_set_intv(idx->bwt, s[0], ik);
-		for (int j = 1; j < b->l_seq; j++) {
-			bwt_extend(idx->bwt, &ik, ok, 0);
-			ik = ok[3 - s[j]];
-			if (ik.x[2] == 0) {
-				break;
-			}
-		}
-		if (ik.x[2] > 0) {
-			// Use the first occurrence in suffix array
-			int64_t x = bwt_sa(idx->bwt, ik.x[0]);
-			em_counter[x]++;
-			bseq1_destroy(&seqs[i]);
-		} else {
-			seqs[not_match_n++] = seqs[i];
+typedef struct{
+	const bwt_t *bwt;
+	const bseq1_t *seqs;
+	int64_t *match_pos; // -1 for unmatched reads
+} worker_t ;
+
+void exact_matching(void *_data, long seq_id, int t_id) {
+	auto *w = (worker_t*)_data;
+	const bwt_t *bwt = w->bwt;
+	const bseq1_t *b = &w->seqs[seq_id];
+
+	auto *s = (uint8_t*)b->seq;
+	bwtintv_t ik, ok[4];
+	bwt_set_intv(bwt, s[0], ik);
+	for (int j = 1; j < b->l_seq; j++) {
+		bwt_extend(bwt, &ik, ok, 0);
+		ik = ok[3 - s[j]];
+		if (ik.x[2] == 0) {
+			break;
 		}
 	}
-	return not_match_n;
+	if (ik.x[2] > 0) {
+		// Use the first occurrence in suffix array
+		w->match_pos[seq_id] = bwt_sa(bwt, ik.x[0]);
+		bseq1_destroy(b); // Matched reads are deallocated here.
+	} else {
+		w->match_pos[seq_id] = -1;
+	}
 }
+
 
 /** Parallelism over I/O and processing */
 typedef struct {
@@ -197,11 +201,24 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 		return ret;
 	}
 	else if (step == 1) { // Process
-		const bwaidx_t *idx = aux->idx;
 		aux->n_sample_seqs += data->n_seqs;
 		// 1. Identify exactly matched reads
 		t_start = realtime();
-		int n_rest = exact_matching(idx, data->n_seqs, data->seqs, aux->em_counter);
+		worker_t w;
+		w.bwt = aux->idx->bwt;
+		w.match_pos = (int64_t*) malloc(data->n_seqs * sizeof(int64_t));
+		w.seqs = data->seqs;
+		kt_for(aux->n_threads, exact_matching, &w, data->n_seqs);
+		int n_rest = 0;
+		for (int i = 0; i < data->n_seqs; i++) {
+			int64_t pos = w.match_pos[i];
+			if (pos != -1) {
+				aux->em_counter[pos]++;
+			} else {
+				data->seqs[n_rest++] = data->seqs[i];
+			}
+		}
+		free(w.match_pos);
 		aux->n_matched_seqs += data->n_seqs - n_rest;
 		t_end = realtime();
 		aux->t_match += t_end - t_start;
@@ -213,7 +230,7 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 		for (int j = 0; j < n_rest; j++) {
 			bseq1_t *b = &data->seqs[j];
 			aux->trie_counter->add_read(b->l_seq, b->seq);
-			bseq1_destroy(b);
+			bseq1_destroy(b); // Unmatched reads are deallocated here.
 		}
 		t_end = realtime();
 		aux->t_trie += t_end - t_start;
