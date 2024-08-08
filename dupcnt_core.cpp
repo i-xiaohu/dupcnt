@@ -65,30 +65,23 @@ void Trie::add_read(int n, const char *s) {
 void Trie::stat() {
 	fprintf(stderr, "Trie size: %ld\n", nodes.size());
 	int32_t p = 0;
-	int m = nodes.size();
-	int *prev_a = (int*) malloc(m * sizeof(int));
-	int *curr_a = (int*) malloc(m * sizeof(int));
-	int prev_n = 0, curr_n = 0;
-	prev_a[prev_n++] = p;
+	// todo: switch back to vector
+	std::vector<int> prev, curr;
+	prev.push_back(p);
 	for (int i = 0; i < read_length_monitor; i++) {
-		// I previously thought the slowdown was caused by std::swap of two vector.
-		// But actually it is the process of iterating nodes very inefficient.
-		curr_n = 0;
-		for (int j = 0; j < prev_n; j++) {
-			int parent = prev_a[j];
-			for (int k : nodes[parent].x) {
+		curr.clear();
+		for (int t : prev) {
+			for (int k : nodes[t].x) {
 				if (k) {
-					curr_a[curr_n++] = k;
+					curr.push_back(k);
 				}
 			}
 		}
-		std::swap(prev_n, curr_n);
-		std::swap(prev_a, curr_a);
+		std::swap(prev, curr);
 	}
-	unique_n = prev_n; // Leaves are those unique reads
+	unique_n = prev.size(); // Leaves are those unique reads
 	int max_occ = 0, max_id = -1;
-	for (int i = 0; i < prev_n; i++) {
-		int leaf = prev_a[i];
+	for (int leaf : prev) {
 		assert(nodes[leaf].x[0] > 0);
 		if (nodes[leaf].x[0] > max_occ) {
 			max_occ = nodes[leaf].x[0];
@@ -111,8 +104,6 @@ void Trie::stat() {
 	std::reverse(rep_read.begin(), rep_read.end());
 	fprintf(stderr, "The most repetitive read occurs %d times:\n", max_occ);
 	fprintf(stderr, "%s\n", rep_read.c_str());
-	free(prev_a);
-	free(curr_a);
 	fprintf(stderr, "%d unique reads in %d reads\n", unique_n, reads_n);
 }
 
@@ -152,37 +143,5 @@ void process(int n_threads, int n_sample, char *files[]) {
 		counter.stat();
 		t_end = realtime();
 		fprintf(stderr, "Visiting trie in %.2f seconds\n", t_end - t_start);
-
-		// Validating using brute-force
-		t_start = realtime();
-		std::sort(all_seqs.begin(), all_seqs.end());
-		int unique = 1, last = 0, occ = 0, max_occ = 0;
-		for (int j = 1; j < all_seqs.size(); j++) {
-			if (all_seqs[j] != all_seqs[j-1]) {
-				unique++;
-				occ = j - last;
-				last = j;
-				max_occ = std::max(max_occ, occ);
-			}
-		}
-		fprintf(stderr, "Sorting: the most repetitive read appears %d times\n", max_occ);
-		last = 0;
-		for (int j = 1; j < all_seqs.size(); j++) {
-			if (all_seqs[j] != all_seqs[j-1]) {
-				occ = j - last;
-				last = j;
-				if (occ == max_occ) {
-					fprintf(stderr, "%s\n", all_seqs[j-1].c_str());
-					break;
-				}
-			}
-		}
-		t_end = realtime();
-		fprintf(stderr, "Sort reads in %.2f seconds\n", t_end - t_start);
-
-		assert(all_seqs.size() == counter.reads_n);
-		if (unique != counter.unique_n) {
-			fprintf(stderr, "Sort found %d unique reads\n", unique);
-		}
 	}
 }
