@@ -89,10 +89,12 @@ typedef struct {
 	const bwt_t *bwt;
 	const bseq1_t *seqs;
 	int64_t *match_pos; // -1 for unmatched reads
-} worker1_t ;
+	Trie **trie_counter;
+	std::vector<bseq1_t> *unmatched_seqs;
+} worker_t ;
 
 void exact_matching(void *_data, long seq_id, int t_id) {
-	auto *w = (worker1_t*)_data;
+	auto *w = (worker_t*)_data;
 	const bwt_t *bwt = w->bwt;
 	const bseq1_t *b = &w->seqs[seq_id];
 
@@ -115,28 +117,17 @@ void exact_matching(void *_data, long seq_id, int t_id) {
 	}
 }
 
-typedef struct {
-	Trie **trie_counter;
-	const bseq1_t *seqs;
-	int n_rest;
-} worker2_t;
-
 void trie_insert(void *_data, long bucket_id, int t_id) {
-	auto *w = (worker2_t*)_data;
+	auto *w = (worker_t*)_data;
 	Trie *trie_counter = w->trie_counter[bucket_id];
+	std::vector<bseq1_t> &seqs = w->unmatched_seqs[bucket_id];
 	trie_counter->unique_n = 0; // Reset to calculate unique reads added
-	for (int i = 0; i < w->n_rest; i++) {
-		const bseq1_t *b = &w->seqs[i];
-		uint32_t prefix = 0;
-		for (int j = 0; j < TRIE_SHIFT; j++) {
-			prefix <<= 2U;
-			prefix += b->seq[j];
-		}
-		// todo: distribute reads into buckets before this function
-		if (prefix == bucket_id) {
-			trie_counter->add_read(b->l_seq, b->seq);
-		}
+	for (auto &seq : seqs) {
+		const bseq1_t *b = &seq;
+		trie_counter->add_read(b->l_seq, b->seq);
+		bseq1_destroy(b); // Unmatched reads are deallocated here.
 	}
+	seqs.clear(); // Clear the bucket after each trie counting
 }
 
 /** Parallelism over I/O and processing */
@@ -149,6 +140,7 @@ typedef struct {
 	int64_t n_matched_seqs;
 	int64_t n_unique; // Number of left reads in all samples after deduplication
 	Trie **trie_counter;
+	std::vector<bseq1_t> *unmatched_seqs;
 	int32_t *em_counter;
 	int32_t max_occ; // Occurrence number of most repetitive reads
 	int sample_id;
@@ -199,23 +191,31 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 		double cpu_ratio1, cpu_ratio2;
 		t_start = realtime();
 		c_start = cputime();
-		worker1_t w1;
-		w1.bwt = aux->idx->bwt;
-		w1.match_pos = (int64_t*) malloc(data->n_seqs * sizeof(int64_t));
-		w1.seqs = data->seqs;
-		kt_for(aux->n_threads, exact_matching, &w1, data->n_seqs);
+		worker_t w;
+		w.bwt = aux->idx->bwt;
+		w.seqs = data->seqs;
+		w.trie_counter = aux->trie_counter;
+		w.unmatched_seqs = aux->unmatched_seqs;
+		w.match_pos = (int64_t*) malloc(data->n_seqs * sizeof(int64_t));
+		kt_for(aux->n_threads, exact_matching, &w, data->n_seqs);
 		int n_rest = 0;
 		for (int i = 0; i < data->n_seqs; i++) {
-			int64_t pos = w1.match_pos[i];
+			int64_t pos = w.match_pos[i];
 			if (pos != -1) {
 				if (aux->em_counter[pos] == 0) aux->n_unique++;
 				aux->em_counter[pos]++;
 				aux->max_occ = std::max(aux->max_occ, aux->em_counter[pos]);
 			} else {
-				data->seqs[n_rest++] = data->seqs[i];
+				uint32_t prefix = 0;
+				for (int j = 0; j < TRIE_SHIFT; j++) {
+					prefix <<= 2U;
+					prefix += data->seqs[i].seq[j];
+				}
+				w.unmatched_seqs[prefix].push_back(data->seqs[i]);
+				n_rest++;
 			}
 		}
-		free(w1.match_pos);
+		free(w.match_pos);
 		aux->n_matched_seqs += data->n_seqs - n_rest;
 		t_end = realtime();
 		c_end = cputime();
@@ -223,15 +223,9 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 		cpu_ratio1 = (c_end - c_start) / (t_end - t_start);
 
 		// 2. Process unmatched reads using trie
-		// fixme: trie is slower than I expect
 		t_start = realtime();
 		c_start = cputime();
-		worker2_t w2;
-		w2.seqs = data->seqs;
-		w2.n_rest = n_rest;
-		w2.trie_counter = aux->trie_counter;
-		kt_for(aux->n_threads, trie_insert, &w2, TRIE_BUCKET_SIZE);
-		for (int i = 0; i < n_rest; i++) bseq1_destroy(&data->seqs[i]);
+		kt_for(aux->n_threads, trie_insert, &w, TRIE_BUCKET_SIZE);
 		for (int i = 0; i < TRIE_BUCKET_SIZE; i++) {
 			aux->n_unique += aux->trie_counter[i]->unique_n;
 //			aux->max_occ = std::max(aux->max_occ, aux->trie_counter[i]->get_max_occ());
@@ -276,6 +270,7 @@ void process(int n_threads, const char *index_prefix, int n_sample, char *files[
 	aux.t_start = realtime();
 	aux.trie_counter = new Trie*[TRIE_BUCKET_SIZE];
 	for (int i = 0; i < TRIE_BUCKET_SIZE; i++) aux.trie_counter[i] = new Trie();
+	aux.unmatched_seqs = new std::vector<bseq1_t>[TRIE_BUCKET_SIZE];
 
 	for (int i = 0; i < n_sample; i++) {
 		gzFile fp = gzopen(files[i], "r");
@@ -305,4 +300,5 @@ void process(int n_threads, const char *index_prefix, int n_sample, char *files[
 	free(aux.em_counter);
 	for (int i = 0; i < TRIE_BUCKET_SIZE; i++) delete aux.trie_counter[i];
 	delete [] aux.trie_counter;
+	delete [] aux.unmatched_seqs;
 }
