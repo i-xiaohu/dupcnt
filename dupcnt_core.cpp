@@ -9,6 +9,7 @@
 #include <cassert>
 #include <sys/time.h>
 #include <algorithm>
+#include <sys/resource.h>
 #include "dupcnt_core.h"
 #include "bwalib/bwa.h"
 #include "cstl/kthread.h"
@@ -68,6 +69,13 @@ double realtime()
 	struct timezone tzp;
 	gettimeofday(&tp, &tzp);
 	return tp.tv_sec + tp.tv_usec * 1e-6;
+}
+
+double cputime()
+{
+	struct rusage r;
+	getrusage(RUSAGE_SELF, &r);
+	return r.ru_utime.tv_sec + r.ru_stime.tv_sec + 1e-6 * (r.ru_utime.tv_usec + r.ru_stime.tv_usec);
 }
 
 static inline void bseq1_destroy(const bseq1_t *b) {
@@ -143,12 +151,11 @@ typedef struct {
 	Trie **trie_counter;
 	int32_t *em_counter;
 	int32_t max_occ; // Occurrence number of most repetitive reads
+	int sample_id;
+	int batch_id;
 
 	// Time profiler
-	double t_input, t_match, t_trie;
-
-	// Brute-force validation
-	std::vector<std::string> reads;
+	double t_start, t_input, t_match, t_trie;
 } ktp_aux_t;
 
 typedef struct {
@@ -158,7 +165,7 @@ typedef struct {
 } ktp_data_t;
 
 static void *dual_pipeline(void *shared, int step, void *_data) {
-	double t_start, t_end;
+	double t_start, t_end, c_start, c_end;
 	auto *aux = (ktp_aux_t*)shared;
 	auto *data = (ktp_data_t*)_data;
 	if (step == 0) { // Input
@@ -169,7 +176,6 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 			free(ret);
 			return 0;
 		}
-		std::string read;
 		for (int i = 0; i < ret->n_seqs; i++) {
 			bseq1_t *b = &ret->seqs[i];
 			// Check read length
@@ -178,22 +184,21 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 				fprintf(stderr, "Only fix-length reads are supported\n");
 				std::abort();
 			}
-			if (read.empty()) read.resize(read_length_monitor);
 			// Convert non-ACGT to A
 			for (int k = 0; k < b->l_seq; k++) {
 				b->seq[k] = nst_nt4_table[(uint8_t)b->seq[k]];
 				if (b->seq[k] > 3) b->seq[k] = 0;
-				read[k] = "ACGT"[b->seq[k]];
 			}
-			aux->reads.push_back(read);
 		}
-		aux->t_input = realtime() - t_start;
+		aux->t_input += realtime() - t_start;
 		return ret;
 	}
 	else if (step == 1) { // Process
 		aux->n_sample_seqs += data->n_seqs;
 		// 1. Identify exactly matched reads
+		double cpu_ratio1, cpu_ratio2;
 		t_start = realtime();
+		c_start = cputime();
 		worker1_t w1;
 		w1.bwt = aux->idx->bwt;
 		w1.match_pos = (int64_t*) malloc(data->n_seqs * sizeof(int64_t));
@@ -213,12 +218,14 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 		free(w1.match_pos);
 		aux->n_matched_seqs += data->n_seqs - n_rest;
 		t_end = realtime();
+		c_end = cputime();
 		aux->t_match += t_end - t_start;
-		fprintf(stderr, "%.2f %% matched reads\n", 100.0 * (double)(data->n_seqs - n_rest) / data->n_seqs);
+		cpu_ratio1 = (c_end - c_start) / (t_end - t_start);
 
 		// 2. Process unmatched reads using trie
 		// fixme: trie is slower than I expect
 		t_start = realtime();
+		c_start = cputime();
 		worker2_t w2;
 		w2.seqs = data->seqs;
 		w2.n_rest = n_rest;
@@ -227,10 +234,16 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 		for (int i = 0; i < n_rest; i++) bseq1_destroy(&data->seqs[i]);
 		for (int i = 0; i < TRIE_BUCKET_SIZE; i++) {
 			aux->n_unique += aux->trie_counter[i]->unique_n;
-			aux->max_occ = std::max(aux->max_occ, aux->trie_counter[i]->get_max_occ());
+//			aux->max_occ = std::max(aux->max_occ, aux->trie_counter[i]->get_max_occ());
 		}
 		t_end = realtime();
+		c_end = cputime();
 		aux->t_trie += t_end - t_start;
+		cpu_ratio2 = (c_end - c_start) / (t_end - t_start);
+		fprintf(stderr, "[Sample %d Batch %d] %ld reads processed; %.2f seconds elapsed (Input %.2f, Match %.2f, Trie %.2f); Match %.2f; Trie %.2f\n",
+		        aux->sample_id, aux->batch_id++, aux->n_sample_seqs,
+		        t_end - aux->t_start, aux->t_input, aux->t_match, aux->t_trie,
+		        cpu_ratio1, cpu_ratio2);
 		free(data->seqs);
 		free(data);
 		return 0;
@@ -239,7 +252,6 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 }
 
 void process(int n_threads, const char *index_prefix, int n_sample, char *files[]) {
-	double t_start, t_end;
 	/* FM-index from BWA-MEM; todo: do consider switch to BWA-MEM2 index */
 	bwaidx_t *idx = bwa_idx_load_from_shm(index_prefix);
 	if (idx == nullptr) {
@@ -261,7 +273,8 @@ void process(int n_threads, const char *index_prefix, int n_sample, char *files[
 	aux.n_unique = 0;
 	aux.max_occ = 0;
 	aux.em_counter = (int32_t*) calloc(ref_len, sizeof(int32_t));
-	aux.trie_counter = new Trie*[BATCH_SIZE];
+	aux.t_start = realtime();
+	aux.trie_counter = new Trie*[TRIE_BUCKET_SIZE];
 	for (int i = 0; i < TRIE_BUCKET_SIZE; i++) aux.trie_counter[i] = new Trie();
 
 	for (int i = 0; i < n_sample; i++) {
@@ -272,28 +285,24 @@ void process(int n_threads, const char *index_prefix, int n_sample, char *files[
 		}
 		aux.t_input = aux.t_match = aux.t_trie = 0;
 		aux.ks = kseq_init(fp);
+		aux.sample_id = i + 1;
+		aux.batch_id = 1;
 
 		kt_pipeline(2, dual_pipeline, &aux, 2);
 
-		std::sort(aux.reads.begin(), aux.reads.end());
-		int n = 1;
-		for (int j = 1; j < aux.reads.size(); j++) {
-			if (aux.reads[j-1] != aux.reads[j]) {
-				n++;
-			}
-		}
-		fprintf(stderr, "%d\n", n);
-
 		fprintf(stderr, "%d sample(s) processed\n", i + 1);
-		fprintf(stderr, "  Time profile(s):       input %.2f; Match %.2f; Trie %.2f; Post %.2f\n", aux.t_input, aux.t_match, aux.t_trie, t_end - t_start);
+		fprintf(stderr, "  Time profile(s):       input %.2f; Match %.2f; Trie %.2f\n", aux.t_input, aux.t_match, aux.t_trie);
 		fprintf(stderr, "  Number of reads:       %ld\n", aux.n_sample_seqs);
 		fprintf(stderr, "  Exactly matched reads: %ld (%.2f %%)\n", aux.n_matched_seqs, 100.0 * aux.n_matched_seqs / aux.n_sample_seqs);
 		fprintf(stderr, "  Unique reads:          %ld (%.2f %%)\n", aux.n_unique, 100.0 * aux.n_unique / aux.n_sample_seqs);
-		fprintf(stderr, "  Max occurrence:        %d\n", aux.max_occ);
+//		fprintf(stderr, "  Max occurrence:        %d\n", aux.max_occ);
 		fprintf(stderr, "\n");
+
+		kseq_destroy(aux.ks);
+		gzclose(fp);
 	}
 
 	free(aux.em_counter);
-	for (int i = 0; i <= TRIE_BUCKET_SIZE; i++) delete aux.trie_counter[i];
+	for (int i = 0; i < TRIE_BUCKET_SIZE; i++) delete aux.trie_counter[i];
 	delete [] aux.trie_counter;
 }
