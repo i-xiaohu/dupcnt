@@ -29,18 +29,14 @@ struct TrNode {
 struct RepRead {
 	int occ;
 	std::string read;
-	RepRead(int c, std::string r): occ(c), read(std::move(r)) {}
 	bool operator < (const RepRead &r) const {
-		return occ < r.occ; // Put most frequent read at the top of heap
+		return occ > r.occ; // Put less frequent read at the top of heap
 	}
 };
 
 class Trie {
 private:
 	std::vector<TrNode> nodes; /** Nodes in the trie */
-
-	/** DFS to traverse trie */
-	void dfs(int root, std::string &read, std::vector<RepRead> &heap, int k);
 
 public:
 	int unique_n; // Number of reads that have no identical match in the trie
@@ -62,13 +58,13 @@ public:
 
 	size_t get_size() { return nodes.capacity() * sizeof(TrNode); }
 
-	std::vector<RepRead> most_k_frequent(int k);
+	std::vector<RepRead> most_k_frequent(uint32_t bucket_id, int k);
 };
 
 struct Option {
 	int n_threads = 16;
 	int batch_size = 10 * 1000 * 1000; // 10M bases for each thread
-	int most_rep = 10;
+	int most_rep = 0;
 	const char *index_prefix = nullptr;
 	size_t mem_cap = 100L * 1024L * 1024L * 1024L; // 100GB
 };

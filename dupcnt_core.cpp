@@ -135,31 +135,50 @@ void Trie::auto_adjust_size() {
 	}
 }
 
-void Trie::dfs(int root, std::string &read, std::vector<RepRead> &heap, int k) {
-	if (read.length() == read_length_monitor) {
-		int o = nodes[root].x[0];
-		if (heap.size() < k) {
-			heap.emplace_back(RepRead(o, read));
-			std::push_heap(heap.begin(), heap.end());
-		} else if (o > heap[0].occ) {
-			heap[0] = RepRead(o, read);
-			std::make_heap(heap.begin(), heap.end());
-		}
-	}
-	for (int i = 0; i < 4; i++) {
-		int c = nodes[root].x[i];
-		if (c) {
-			read.push_back("ACGT"[i]);
-			dfs(c, read, heap, k);
-			read.pop_back();
-		}
-	}
-}
+struct Tuple {
+	int node_id;
+	int depth;
+	int label;
+	Tuple(int n, int d, int l) : node_id(n), depth(d), label(l) {}
+};
 
-std::vector<RepRead> Trie::most_k_frequent(int k) {
+std::vector<RepRead> Trie::most_k_frequent(uint32_t bucket_id, int k) {
 	std::vector<RepRead> heap;
-	std::string read;
-	dfs(0, read, heap, k);
+	char seq[read_length_monitor + 1];
+	seq[read_length_monitor] = '\0';
+	std::stack<Tuple> st;
+	for (int l = 3; l >= 0; l--) { // Preorder
+		int c = nodes[0].x[l];
+		if (c) st.push(Tuple(c, TRIE_SHIFT, l));
+	}
+	for (int i = TRIE_SHIFT-1; i >= 0; i--) {
+		seq[i] = "ACGT"[bucket_id & 3U];
+		bucket_id >> 2U;
+	}
+
+	while (not st.empty()) {
+		auto t = st.top();
+		st.pop();
+		seq[t.depth] = "ACGT"[t.label];
+		if (t.depth == read_length_monitor - 1) { // Leaf layer
+			RepRead r;
+			r.occ = nodes[t.node_id].x[0];
+			r.read = std::string(seq);
+			if (heap.size() < k) {
+				heap.push_back(r);
+				std::push_heap(heap.begin(), heap.end());
+			} else if (r.occ > heap[0].occ) {
+				heap[0] = r;
+				std::make_heap(heap.begin(), heap.end());
+			}
+		} else {
+			for (int l = 3; l >= 0; l--) {
+				int c = nodes[t.node_id].x[l];
+				if (c) st.push(Tuple(c, t.depth + 1, l));
+			}
+		}
+	}
+
 	return heap;
 }
 
@@ -243,7 +262,6 @@ typedef struct {
 	Trie **trie_counter;
 	std::vector<bseq1_t> *unmatched_seqs;
 	int32_t *em_counter;
-	int32_t max_occ; // Occurrence number of most repetitive reads
 	int oversize_n;
 	int sample_id;
 	int batch_id;
@@ -307,7 +325,6 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 			if (pos != -1) {
 				if (aux->em_counter[pos] == 0) aux->n_unique++;
 				aux->em_counter[pos]++;
-				aux->max_occ = std::max(aux->max_occ, aux->em_counter[pos]);
 			} else {
 				uint32_t prefix = 0;
 				for (int j = 0; j < TRIE_SHIFT; j++) {
@@ -333,10 +350,7 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 		aux->oversize_n += vram > opt->mem_cap;
 		for (int i = 0; i < TRIE_BUCKET_SIZE; i++) aux->trie_counter[i]->overflow = vram > opt->mem_cap;
 		kt_for(opt->n_threads, trie_insert, &w, TRIE_BUCKET_SIZE);
-		for (int i = 0; i < TRIE_BUCKET_SIZE; i++) {
-			aux->n_unique += aux->trie_counter[i]->unique_n;
-//			aux->max_occ = std::max(aux->max_occ, aux->trie_counter[i]->get_max_occ());
-		}
+		for (int i = 0; i < TRIE_BUCKET_SIZE; i++) aux->n_unique += aux->trie_counter[i]->unique_n;
 		t_end = realtime();
 		c_end = cputime();
 		aux->t_trie += t_end - t_start;
@@ -352,11 +366,11 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 	return 0;
 }
 
-void pickup_frequent(int k, Trie **trie_counter, int *em_counter, const bwaidx_t *idx) {
+void pickup_frequent(int k, Trie **trie_counter, const int *em_counter, const bwaidx_t *idx) {
 	if (k <= 0) return ;
 	std::vector<RepRead> heap;
 	for (int i = 0; i < TRIE_BUCKET_SIZE; i++) {
-		auto sub_heap = trie_counter[i]->most_k_frequent(k);
+		auto sub_heap = trie_counter[i]->most_k_frequent(i, k);
 		for (auto &r : sub_heap) {
 			if (heap.size() < k) {
 				heap.push_back(r);
@@ -367,9 +381,31 @@ void pickup_frequent(int k, Trie **trie_counter, int *em_counter, const bwaidx_t
 			}
 		}
 	}
-	for (auto &r : heap) {
-		fprintf(stderr, "%s %d\n", r.read.c_str(), r.occ);
+	for (int64_t i = 0; i < idx->bns->l_pac << 1; i++) {
+		RepRead r;
+		r.occ = em_counter[i];
+		if (heap.size() < k or r.occ > heap[0].occ) {
+			int64_t len;
+			uint8_t *seq = bns_get_seq(idx->bns->l_pac, idx->pac, i, i + read_length_monitor, &len);
+			assert(len == read_length_monitor);
+			r.read.resize(len);
+			for (int j = 0; j < len; j++) r.read[j] = "ACGT"[seq[j]];
+			free(seq);
+		}
+		if (heap.size() < k) {
+			heap.push_back(r);
+			std::push_heap(heap.begin(), heap.end());
+		} else if (r.occ > heap[0].occ) {
+			heap[0] = r;
+			std::make_heap(heap.begin(), heap.end());
+		}
 	}
+	std::sort(heap.begin(), heap.end());
+	fprintf(stderr, "The %d most frequent read:\n", k);
+	for (auto &r : heap) {
+		fprintf(stderr, "  %s %d\n", r.read.c_str(), r.occ);
+	}
+	fprintf(stderr, "\n");
 }
 
 void process(const Option *opt, int n_sample, char *files[]) {
@@ -390,7 +426,6 @@ void process(const Option *opt, int n_sample, char *files[]) {
 	aux.n_sample_seqs = 0;
 	aux.n_matched_seqs = 0;
 	aux.n_unique = 0;
-	aux.max_occ = 0;
 	aux.em_counter = (int32_t*) calloc(ref_len, sizeof(int32_t));
 	aux.t_start = realtime();
 	aux.trie_counter = new Trie*[TRIE_BUCKET_SIZE];
@@ -417,9 +452,9 @@ void process(const Option *opt, int n_sample, char *files[]) {
 		fprintf(stderr, "  Exactly matched reads: %ld (%.2f %%)\n", aux.n_matched_seqs, 100.0 * aux.n_matched_seqs / aux.n_sample_seqs);
 		fprintf(stderr, "  Unique reads:          %ld (%.2f %%)\n", aux.n_unique, 100.0 * aux.n_unique / aux.n_sample_seqs);
 		fprintf(stderr, "  Oversize times:        %d\n", aux.oversize_n);
-//		fprintf(stderr, "  Max occurrence:        %d\n", aux.max_occ);
 		fprintf(stderr, "\n");
 
+		// todo: parallel the function
 		pickup_frequent(opt->most_rep, aux.trie_counter, aux.em_counter, aux.idx);
 
 		kseq_destroy(aux.ks);
