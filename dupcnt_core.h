@@ -30,6 +30,7 @@ private:
 
 public:
 	int unique_n; // Number of reads that have no identical match in the trie
+	bool overflow;
 
 	/** Construction: init root node */
 	Trie();
@@ -43,10 +44,19 @@ public:
 
 	int get_max_occ();
 
-	/** */
 	void auto_adjust_size();
+
+	size_t get_size() { return nodes.capacity() * sizeof(TrNode); }
 };
 
-void process(int n_threads, const char *index_prefix, int n_sample, char *files[]);
+struct Option {
+	int n_threads = 16;
+	int batch_size = 10 * 1000 * 1000; // 10M bases for each thread
+	bool debug = false;
+	const char *index_prefix = nullptr;
+	size_t mem_cap = 100L * 1024L * 1024L * 1024L; // 100GB
+};
+
+void process(const Option *opt, int n_sample, char *files[]);
 
 #endif //DUPCNT_DEDUP_CORE_H
