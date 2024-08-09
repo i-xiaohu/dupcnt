@@ -9,9 +9,6 @@
 
 int usage() {
 	fprintf(stderr, "Usage: dupcnt -t <threads> -i <index> <Sample1> [Sample2] ...\n");
-	fprintf(stderr, "Fixed parameters:\n");
-	fprintf(stderr, "  TRIE_BATCH:   4096\n");
-	fprintf(stderr, "  TRIE_SIZE:    1953125\n");
 	return 1;
 }
 

@@ -42,6 +42,9 @@ public:
 	void add_read(int n, const char *s);
 
 	int get_max_occ();
+
+	/** */
+	void auto_adjust_size();
 };
 
 void process(int n_threads, const char *index_prefix, int n_sample, char *files[]);

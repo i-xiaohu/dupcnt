@@ -63,6 +63,76 @@ int Trie::get_max_occ() {
 	return ret;
 }
 
+void Trie::auto_adjust_size() {
+	if (nodes.size() > TRIE_SIZE_CAP) {
+//		fprintf(stderr, "Node set size: %ld oversize (%ld bytes)\n", nodes.size(), nodes.capacity() * sizeof(TrNode));
+		std::vector<int> parent; // For backtrace
+		std::vector<bool> kept; // True if node is kept
+		std::vector<int> shift; // For coordinate shift
+		std::vector<TrNode> new_nodes;
+		std::vector<int> prev, curr;
+		int kept_n;
+		parent.resize(nodes.size());
+		kept.resize(nodes.size(), false);
+		prev.push_back(0); // Root
+		for (int i = TRIE_SHIFT; i < read_length_monitor; i++) {
+			curr.clear();
+			for (int p : prev) {
+				for (int c : nodes[p].x) {
+					if (c) {
+						parent[c] = p;
+						curr.push_back(c);
+					}
+				}
+			}
+			std::swap(prev, curr);
+		}
+		// Sort by frequency
+		std::sort(prev.begin(), prev.end(),
+			[&](int a, int b) -> bool { return nodes[a].x[0] > nodes[b].x[0]; }
+		);
+		kept[0] = true;
+		kept_n = 1;
+		for (int x: prev) {
+			while (x != 0) {
+				if (kept[x]) break; // All ancestors kept
+				kept[x] = true;
+				kept_n++;
+				x = parent[x];
+			}
+			// Half the size
+			if (kept_n > nodes.size() >> 1U) {
+				break;
+			}
+		}
+		parent.clear();
+		prev.clear();
+		curr.clear();
+
+		// Shifting coordinate
+		shift.resize(nodes.size());
+		shift[0] = 0;
+		kept_n = 1;
+		for (int i = 1; i < nodes.size(); i++) {
+			if (kept[i]) {
+				shift[i] = kept_n++;
+				new_nodes.push_back(nodes[i]);
+			} else shift[i] = 0;
+		}
+		for (auto &p : new_nodes) {
+			// Update child index
+			// It is correct because c = 0, shift[c] = 0 and kept[c] = 0, shift[c] = 0;
+			for (int &c : p.x) {
+				c = shift[c];
+			}
+		}
+		nodes = new_nodes;
+
+		kept.clear();
+		shift.clear();
+	}
+}
+
 double realtime()
 {
 	struct timeval tp;
@@ -128,6 +198,8 @@ void trie_insert(void *_data, long bucket_id, int t_id) {
 		bseq1_destroy(b); // Unmatched reads are deallocated here.
 	}
 	seqs.clear(); // Clear the bucket after each trie counting
+
+	trie_counter->auto_adjust_size();
 }
 
 /** Parallelism over I/O and processing */
