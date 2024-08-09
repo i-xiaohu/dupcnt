@@ -6,7 +6,9 @@
 #define DUPCNT_DEDUP_CORE_H
 
 #include <cstdint>
+#include <utility>
 #include <vector>
+#include <string>
 
 /**
  * The first 6 bases of reads are used to distributed to 4^6 = 4096 tries.
@@ -24,9 +26,21 @@ struct TrNode {
 	int32_t x[4] = {0};
 };
 
+struct RepRead {
+	int occ;
+	std::string read;
+	RepRead(int c, std::string r): occ(c), read(std::move(r)) {}
+	bool operator < (const RepRead &r) const {
+		return occ < r.occ; // Put most frequent read at the top of heap
+	}
+};
+
 class Trie {
 private:
 	std::vector<TrNode> nodes; /** Nodes in the trie */
+
+	/** DFS to traverse trie */
+	void dfs(int root, std::string &read, std::vector<RepRead> &heap, int k);
 
 public:
 	int unique_n; // Number of reads that have no identical match in the trie
@@ -47,12 +61,14 @@ public:
 	void auto_adjust_size();
 
 	size_t get_size() { return nodes.capacity() * sizeof(TrNode); }
+
+	std::vector<RepRead> most_k_frequent(int k);
 };
 
 struct Option {
 	int n_threads = 16;
 	int batch_size = 10 * 1000 * 1000; // 10M bases for each thread
-	bool debug = false;
+	int most_rep = 10;
 	const char *index_prefix = nullptr;
 	size_t mem_cap = 100L * 1024L * 1024L * 1024L; // 100GB
 };

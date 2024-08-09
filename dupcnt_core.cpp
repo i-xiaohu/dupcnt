@@ -10,6 +10,7 @@
 #include <sys/time.h>
 #include <algorithm>
 #include <sys/resource.h>
+#include <stack>
 #include "dupcnt_core.h"
 #include "bwalib/bwa.h"
 #include "cstl/kthread.h"
@@ -132,6 +133,34 @@ void Trie::auto_adjust_size() {
 		kept.clear();
 		shift.clear();
 	}
+}
+
+void Trie::dfs(int root, std::string &read, std::vector<RepRead> &heap, int k) {
+	if (read.length() == read_length_monitor) {
+		int o = nodes[root].x[0];
+		if (heap.size() < k) {
+			heap.emplace_back(RepRead(o, read));
+			std::push_heap(heap.begin(), heap.end());
+		} else if (o > heap[0].occ) {
+			heap[0] = RepRead(o, read);
+			std::make_heap(heap.begin(), heap.end());
+		}
+	}
+	for (int i = 0; i < 4; i++) {
+		int c = nodes[root].x[i];
+		if (c) {
+			read.push_back("ACGT"[i]);
+			dfs(c, read, heap, k);
+			read.pop_back();
+		}
+	}
+}
+
+std::vector<RepRead> Trie::most_k_frequent(int k) {
+	std::vector<RepRead> heap;
+	std::string read;
+	dfs(0, read, heap, k);
+	return heap;
 }
 
 double realtime()
@@ -323,6 +352,26 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 	return 0;
 }
 
+void pickup_frequent(int k, Trie **trie_counter, int *em_counter, const bwaidx_t *idx) {
+	if (k <= 0) return ;
+	std::vector<RepRead> heap;
+	for (int i = 0; i < TRIE_BUCKET_SIZE; i++) {
+		auto sub_heap = trie_counter[i]->most_k_frequent(k);
+		for (auto &r : sub_heap) {
+			if (heap.size() < k) {
+				heap.push_back(r);
+				std::push_heap(heap.begin(), heap.end());
+			} else if (r.occ > heap[0].occ) {
+				heap[0] = r;
+				std::make_heap(heap.begin(), heap.end());
+			}
+		}
+	}
+	for (auto &r : heap) {
+		fprintf(stderr, "%s %d\n", r.read.c_str(), r.occ);
+	}
+}
+
 void process(const Option *opt, int n_sample, char *files[]) {
 	/* FM-index from BWA-MEM; todo: do consider switch to BWA-MEM2 index */
 	bwaidx_t *idx = bwa_idx_load_from_shm(opt->index_prefix);
@@ -370,6 +419,8 @@ void process(const Option *opt, int n_sample, char *files[]) {
 		fprintf(stderr, "  Oversize times:        %d\n", aux.oversize_n);
 //		fprintf(stderr, "  Max occurrence:        %d\n", aux.max_occ);
 		fprintf(stderr, "\n");
+
+		pickup_frequent(opt->most_rep, aux.trie_counter, aux.em_counter, aux.idx);
 
 		kseq_destroy(aux.ks);
 		gzclose(fp);
