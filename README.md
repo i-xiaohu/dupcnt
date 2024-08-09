@@ -15,8 +15,10 @@ impact on the overall result.
 # Usage
 **Options**
 - `-i` FM-index (BWA index currently)
-- `-t` number of threads (16 by default)
-- `-c` Trie maximum size to curb memory consumption (not implemented so far because I haven't observe oversized trie)
+- `-t` Number of threads (16 by default)
+- `-c` Trie maximum size to curb memory consumption (100GB)
+- `-k` Input batch size (10M)
+- `-j` Output the most p frequent reads (0, turn off by default because single-threaded implementation is slow)
 
 # Result
 *dupcnt* outputs time profile after each batch. Trie is super fast and well parallelized (64 threads used here).
@@ -32,7 +34,7 @@ Exact matching has a poor CPU usage, causing a major bottleneck. But *dupcnt* is
 ```
 
 After each sample processed, *dupcnt* outputs statistic information, Of note, `Number of reads`, `Exactly matched reads`
-and `Unique reads` are accumulative values. I plan to output further details  like the most 100 repetitive reads.
+and `Unique reads` are accumulative values.
 ```
 1 sample(s) processed
   Time profile(s):       input 3061.82; Match 1465.94; Trie 268.45

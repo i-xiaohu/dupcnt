@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <getopt.h>
 #include <cstdlib>
+#include <algorithm>
 #include "dupcnt_core.h"
 
 int usage() {
@@ -14,6 +15,7 @@ int usage() {
 	fprintf(stderr ,"  -i <STR> Index prefix\n");
 	fprintf(stderr, "  -k <INT> Batch size\n");
 	fprintf(stderr, "  -c <STR> Trie memory usage upperbound [100G]\n");
+	fprintf(stderr, "  -j <INT> Output the most p frequent reads [0]\n");
 	return 1;
 }
 
@@ -23,7 +25,7 @@ int main(int argc, char *argv[]) {
 	}
 	auto *opt = new Option();
 	int c;
-	while ((c = getopt(argc, argv, "t:i:k:c:")) >= 0) {
+	while ((c = getopt(argc, argv, "t:i:k:c:j:")) >= 0) {
 		if (c == 't') {
 			opt->n_threads = atoi(optarg);
 		} else if (c == 'i') {
@@ -42,6 +44,8 @@ int main(int argc, char *argv[]) {
 					opt->mem_cap *= 1024L * 1024L * 1024L;
 				}
 			}
+		} else if (c == 'j') {
+			opt->most_rep = atoi(optarg);
 		}
 	}
 
