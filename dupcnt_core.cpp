@@ -210,6 +210,10 @@ typedef struct {
 	int64_t *match_pos; // -1 for unmatched reads
 	Trie **trie_counter;
 	std::vector<bseq1_t> *unmatched_seqs;
+	std::vector<RepRead> *heaps;
+	const int32_t *em_counter;
+	const Option *opt;
+	const uint8_t *ref_seq;
 } worker_t ;
 
 void exact_matching(void *_data, long seq_id, int t_id) {
@@ -366,32 +370,15 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 	return 0;
 }
 
-void pickup_frequent(int k, Trie **trie_counter, const int *em_counter, const bwaidx_t *idx) {
-	if (k <= 0) return ;
-	std::vector<RepRead> heap;
-	for (int i = 0; i < TRIE_BUCKET_SIZE; i++) {
-		auto sub_heap = trie_counter[i]->most_k_frequent(i, k);
-		for (auto &r : sub_heap) {
-			if (heap.size() < k) {
-				heap.push_back(r);
-				std::push_heap(heap.begin(), heap.end());
-			} else if (r.occ > heap[0].occ) {
-				heap[0] = r;
-				std::make_heap(heap.begin(), heap.end());
-			}
-		}
-	}
-	for (int64_t i = 0; i < idx->bns->l_pac << 1; i++) {
-		RepRead r;
-		r.occ = em_counter[i];
-		if (heap.size() < k or r.occ > heap[0].occ) {
-			int64_t len;
-			uint8_t *seq = bns_get_seq(idx->bns->l_pac, idx->pac, i, i + read_length_monitor, &len);
-			assert(len == read_length_monitor);
-			r.read.resize(len);
-			for (int j = 0; j < len; j++) r.read[j] = "ACGT"[seq[j]];
-			free(seq);
-		}
+/** Post-processing */
+static void post_worker1(void *data, long seq_id, int t_id) {
+	auto *w = (worker_t*) data;
+	auto &heap = w->heaps[t_id];
+	auto *trie_counter = w->trie_counter[seq_id];
+	int k = w->opt->most_rep;
+	auto sub_heap = trie_counter->most_k_frequent(seq_id, k);
+	// Is STL::make_heap fast enough?
+	for (auto &r : sub_heap) {
 		if (heap.size() < k) {
 			heap.push_back(r);
 			std::push_heap(heap.begin(), heap.end());
@@ -400,8 +387,68 @@ void pickup_frequent(int k, Trie **trie_counter, const int *em_counter, const bw
 			std::make_heap(heap.begin(), heap.end());
 		}
 	}
+
+	std::vector<std::string> q;
+	for (auto &r : sub_heap) {
+		q.push_back(r.read);
+	}
+	std::sort(q.begin(), q.end());
+	for (int i = 1; i < q.size(); i++) {
+		assert(q[i] != q[i-1]);
+	}
+}
+
+static void post_worker2(void *data, long seq_id, int t_id) {
+	auto *w = (worker_t*) data;
+	auto &heap = w->heaps[t_id];
+	const int32_t *em_counter = w->em_counter;
+	const uint8_t *ref_seq = w->ref_seq;
+	int k = w->opt->most_rep;
+
+	RepRead r;
+	r.occ = em_counter[seq_id];
+	if (heap.size() < k or r.occ > heap[0].occ) {
+		r.read.resize(read_length_monitor);
+		for (int j = 0; j < read_length_monitor; j++) r.read[j] = "ACGT"[ref_seq[seq_id + j]];
+	}
+	if (heap.size() < k) {
+		heap.push_back(r);
+		std::push_heap(heap.begin(), heap.end());
+	} else if (r.occ > heap[0].occ) {
+		heap[0] = r;
+		std::make_heap(heap.begin(), heap.end());
+	}
+}
+
+void pickup_frequent(const Option *opt, Trie **trie_counter, const int32_t *em_counter, int64_t ref_len, const uint8_t *ref_seq) {
+	if (opt->most_rep <= 0) return ;
+	worker_t w;
+	w.opt = opt;
+	w.trie_counter = trie_counter;
+	w.em_counter = em_counter;
+	w.heaps = new std::vector<RepRead>[opt->n_threads];
+	w.ref_seq = ref_seq;
+	kt_for(opt->n_threads, post_worker1, &w, TRIE_BUCKET_SIZE);
+	kt_for(opt->n_threads, post_worker2, &w, ref_len);
+
+	// Congregate results
+	std::vector<RepRead> heap = w.heaps[0];
+	for (int i = 1; i < opt->n_threads; i++)  {
+		auto &sub_heap = w.heaps[i];
+		for (const auto &r : sub_heap) {
+			if (heap.size() < opt->most_rep) {
+				heap.push_back(r);
+				std::push_heap(heap.begin(), heap.end());
+			} else if (r.occ > heap[0].occ) {
+				heap[0] = r;
+				std::make_heap(heap.begin(), heap.end());
+			}
+		}
+	}
+	delete [] w.heaps;
+
 	std::sort(heap.begin(), heap.end());
-	fprintf(stderr, "The %d most frequent read:\n", k);
+	fprintf(stderr, "The %d most frequent read:\n", opt->most_rep);
 	for (auto &r : heap) {
 		fprintf(stderr, "  %s %d\n", r.read.c_str(), r.occ);
 	}
@@ -446,21 +493,33 @@ void process(const Option *opt, int n_sample, char *files[]) {
 
 		kt_pipeline(2, dual_pipeline, &aux, 2);
 
-		fprintf(stderr, "%d sample(s) processed\n", i + 1);
-		fprintf(stderr, "  Time profile(s):       input %.2f; Match %.2f; Trie %.2f\n", aux.t_input, aux.t_match, aux.t_trie);
+		fprintf(stderr, "%s added, %d sample(s) processed\n", files[i], i + 1);
+		fprintf(stderr, "  Time profile1(s):      Input %.2f; Match %.2f; Trie %.2f\n", aux.t_input, aux.t_match, aux.t_trie);
 		fprintf(stderr, "  Number of reads:       %ld\n", aux.n_sample_seqs);
 		fprintf(stderr, "  Exactly matched reads: %ld (%.2f %%)\n", aux.n_matched_seqs, 100.0 * aux.n_matched_seqs / aux.n_sample_seqs);
 		fprintf(stderr, "  Unique reads:          %ld (%.2f %%)\n", aux.n_unique, 100.0 * aux.n_unique / aux.n_sample_seqs);
 		fprintf(stderr, "  Oversize times:        %d\n", aux.oversize_n);
 		fprintf(stderr, "\n");
 
-		// todo: parallel the function
-		pickup_frequent(opt->most_rep, aux.trie_counter, aux.em_counter, aux.idx);
-
 		kseq_destroy(aux.ks);
 		gzclose(fp);
 	}
 
+	// Load the entire reference sequence to memory
+	int64_t out_len;
+	uint8_t *ref_seq = bns_get_seq(idx->bns->l_pac, idx->pac, 0, idx->bns->l_pac, &out_len);
+	assert(out_len == idx->bns->l_pac);
+	ref_seq = (uint8_t*) realloc(ref_seq, ref_len * sizeof(uint8_t));
+	for (int64_t i = 0; i < idx->bns->l_pac; i++) {
+		ref_seq[ref_len - 1 - i] = 3 - ref_seq[i];
+	}
+
+	double t_start = realtime(), t_cpu = cputime();
+	pickup_frequent(opt, aux.trie_counter, aux.em_counter, ref_len, ref_seq);
+	fprintf(stderr, "Post processing %.2f CPU seconds, %.2f real seconds\n", realtime() - t_start, cputime() - t_cpu);
+
+	free(ref_seq);
+	bwa_idx_destroy(idx);
 	free(aux.em_counter);
 	for (int i = 0; i < TRIE_BUCKET_SIZE; i++) delete aux.trie_counter[i];
 	delete [] aux.trie_counter;
