@@ -3,10 +3,10 @@
 
 *dupcnt* deduplicates reads in two steps.
 
-1. Pick out repetitive reads that exactly match to HG38 reference utilizing suffix array. Such reads can be easily encoded with
-64-bit integers (alignment position). Or use small integers to count the occurrence of reads at each reference base.
-2. A certain number of tries are used to find the duplication in the rest of reads. Reads in a trie share a common characteristic, 
-such as the same hash value or K prefix bases.
+1. Pick out repetitive reads that exactly match to HG19/HG38 reference utilizing suffix array. Such reads can be easily encoded with
+64-bit integers (alignment position). Or use small integers to count the occurrence of reads at each reference position.
+2. A certain number of tries are used to find duplications in the rest of reads. Here, reads in a trie share the same 6 bases, 
+facilitating parallelism over 4096 tries.
 
 To avoid excessive memory usage, the sizes of tries are capped. The less frequently visited nodes or paths will be deleted 
 once the trie is oversized. Though it would make the duplication counting not accurate, it shouldn't have a significant 
@@ -16,9 +16,9 @@ impact on the overall result.
 **Options**
 - `-i` FM-index (BWA index currently)
 - `-t` Number of threads (16 by default)
-- `-c` Trie maximum size to curb memory consumption (100GB)
+- `-c` Trie maximum size to curb memory consumption (100GB by default, but needing ~150GB in practice)
 - `-k` Input batch size (10M)
-- `-j` Output the most p frequent reads (0, turn off by default because single-threaded implementation is slow)
+- `-j` Output the most p frequent reads
 
 # Result
 *dupcnt* outputs time profile after each batch. Trie is super fast and well parallelized (64 threads used here).
@@ -42,3 +42,5 @@ and `Unique reads` are accumulative values.
   Exactly matched reads: 693426503 (80.26 %)
   Unique reads:          779264875 (90.20 %)
 ```
+
+After all samples added, *dupcnt* outputs the k most frequent reads with frequency.
