@@ -25,7 +25,7 @@ int main(int argc, char *argv[]) {
 	}
 	auto *opt = new Option();
 	int c;
-	while ((c = getopt(argc, argv, "t:i:k:c:j:")) >= 0) {
+	while ((c = getopt(argc, argv, "t:i:k:c:j:h:")) >= 0) {
 		if (c == 't') {
 			opt->n_threads = atoi(optarg);
 		} else if (c == 'i') {
@@ -46,6 +46,10 @@ int main(int argc, char *argv[]) {
 			}
 		} else if (c == 'j') {
 			opt->most_rep = atoi(optarg);
+		} else {
+			fprintf(stderr, "Unrecognized option `-%c`\n", c);
+			free(opt);
+			return usage();
 		}
 	}
 
@@ -54,8 +58,10 @@ int main(int argc, char *argv[]) {
 		return 1;
 	}
 
-	fprintf(stderr, "%d samples to process\n", argc - optind);
+	fprintf(stderr, "%d sample(s) to process\n", argc - optind);
 	process(opt, argc - optind, argv + optind);
+
+	delete opt;
 
 	return 0;
 }

@@ -22,7 +22,7 @@ KSEQ_INIT(gzFile, gzread)
 
 Trie::Trie() {
 	unique_n = 0;
-	overflow = true;
+	overflow = false;
 	nodes.clear();
 	nodes.emplace_back(TrNode());
 }
@@ -66,6 +66,7 @@ int Trie::get_max_occ() {
 }
 
 void Trie::auto_adjust_size() {
+	// fixme: the function cannot restrict memory < 128GB
 	if (overflow and nodes.size() > TRIE_SIZE_CAP) {
 //		fprintf(stderr, "Trie size: %ld oversize (%ld bytes)\n", nodes.size(), nodes.capacity() * sizeof(TrNode));
 		std::vector<int> parent; // For backtrace
@@ -168,8 +169,9 @@ std::vector<RepRead> Trie::most_k_frequent(uint32_t bucket_id, int k) {
 				heap.push_back(r);
 				std::push_heap(heap.begin(), heap.end());
 			} else if (r.occ > heap[0].occ) {
-				heap[0] = r;
-				std::make_heap(heap.begin(), heap.end());
+				std::pop_heap(heap.begin(), heap.end());
+				heap.back() = r;
+				std::push_heap(heap.begin(), heap.end());
 			}
 		} else {
 			for (int l = 3; l >= 0; l--) {
@@ -306,6 +308,7 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 				b->seq[k] = nst_nt4_table[(uint8_t)b->seq[k]];
 				if (b->seq[k] > 3) b->seq[k] = 0;
 			}
+			// todo: strand correction heuristic
 		}
 		aux->t_input += realtime() - t_start;
 		return ret;
@@ -377,24 +380,16 @@ static void post_worker1(void *data, long seq_id, int t_id) {
 	auto *trie_counter = w->trie_counter[seq_id];
 	int k = w->opt->most_rep;
 	auto sub_heap = trie_counter->most_k_frequent(seq_id, k);
-	// Is STL::make_heap fast enough?
 	for (auto &r : sub_heap) {
 		if (heap.size() < k) {
 			heap.push_back(r);
 			std::push_heap(heap.begin(), heap.end());
 		} else if (r.occ > heap[0].occ) {
-			heap[0] = r;
-			std::make_heap(heap.begin(), heap.end());
+			// I should NOT use make_heap(); It might build a heap from beginning in O(N*log(N)) time
+			std::pop_heap(heap.begin(), heap.end());
+			heap.back() = r;
+			std::push_heap(heap.begin(), heap.end());
 		}
-	}
-
-	std::vector<std::string> q;
-	for (auto &r : sub_heap) {
-		q.push_back(r.read);
-	}
-	std::sort(q.begin(), q.end());
-	for (int i = 1; i < q.size(); i++) {
-		assert(q[i] != q[i-1]);
 	}
 }
 
@@ -415,12 +410,14 @@ static void post_worker2(void *data, long seq_id, int t_id) {
 		heap.push_back(r);
 		std::push_heap(heap.begin(), heap.end());
 	} else if (r.occ > heap[0].occ) {
-		heap[0] = r;
-		std::make_heap(heap.begin(), heap.end());
+		std::pop_heap(heap.begin(), heap.end());
+		heap.back() = r;
+		std::push_heap(heap.begin(), heap.end());
 	}
 }
 
 void pickup_frequent(const Option *opt, Trie **trie_counter, const int32_t *em_counter, int64_t ref_len, const uint8_t *ref_seq) {
+	double t_real, t_cpu;
 	if (opt->most_rep <= 0) return ;
 	worker_t w;
 	w.opt = opt;
@@ -428,8 +425,9 @@ void pickup_frequent(const Option *opt, Trie **trie_counter, const int32_t *em_c
 	w.em_counter = em_counter;
 	w.heaps = new std::vector<RepRead>[opt->n_threads];
 	w.ref_seq = ref_seq;
+	t_real = realtime(); t_cpu = cputime();
 	kt_for(opt->n_threads, post_worker1, &w, TRIE_BUCKET_SIZE);
-	kt_for(opt->n_threads, post_worker2, &w, ref_len);
+	fprintf(stderr, "post_worker1: %.2f real seconds, %.2f CPU seconds\n", realtime() - t_real, cputime() - t_cpu);
 
 	// Congregate results
 	std::vector<RepRead> heap = w.heaps[0];
@@ -440,12 +438,37 @@ void pickup_frequent(const Option *opt, Trie **trie_counter, const int32_t *em_c
 				heap.push_back(r);
 				std::push_heap(heap.begin(), heap.end());
 			} else if (r.occ > heap[0].occ) {
-				heap[0] = r;
-				std::make_heap(heap.begin(), heap.end());
+				std::pop_heap(heap.begin(), heap.end());
+				heap.back() = r;
+				std::push_heap(heap.begin(), heap.end());
 			}
 		}
 	}
 	delete [] w.heaps;
+
+	t_real = realtime(); t_cpu = cputime();
+//	kt_for(opt->n_threads, post_worker2, &w, ref_len);
+	{
+		// kt-for is slower than linear scanning
+		int k = opt->most_rep;
+		for (int64_t seq_id; seq_id < ref_len - read_length_monitor; seq_id++) {
+			RepRead r;
+			r.occ = em_counter[seq_id];
+			if (heap.size() < k or r.occ > heap[0].occ) {
+				r.read.resize(read_length_monitor);
+				for (int j = 0; j < read_length_monitor; j++) r.read[j] = "ACGT"[ref_seq[seq_id + j]];
+			}
+			if (heap.size() < k) {
+				heap.push_back(r);
+				std::push_heap(heap.begin(), heap.end());
+			} else if (r.occ > heap[0].occ) {
+				std::pop_heap(heap.begin(), heap.end());
+				heap.back() = r;
+				std::push_heap(heap.begin(), heap.end());
+			}
+		}
+	}
+	fprintf(stderr, "post_worker2: %.2f real seconds, %.2f CPU seconds\n", realtime() - t_real, cputime() - t_cpu);
 
 	std::sort(heap.begin(), heap.end());
 	fprintf(stderr, "The %d most frequent read:\n", opt->most_rep);
