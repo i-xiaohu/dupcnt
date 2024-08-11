@@ -154,7 +154,7 @@ std::vector<RepRead> Trie::most_k_frequent(uint32_t bucket_id, int k) {
 	}
 	for (int i = TRIE_SHIFT-1; i >= 0; i--) {
 		seq[i] = "ACGT"[bucket_id & 3U];
-		bucket_id >> 2U;
+		bucket_id >>= 2U;
 	}
 
 	while (not st.empty()) {
@@ -164,6 +164,7 @@ std::vector<RepRead> Trie::most_k_frequent(uint32_t bucket_id, int k) {
 		if (t.depth == read_length_monitor - 1) { // Leaf layer
 			RepRead r;
 			r.occ = nodes[t.node_id].x[0];
+			assert(r.occ > 0);
 			r.read = std::string(seq);
 			if (heap.size() < k) {
 				heap.push_back(r);
@@ -392,16 +393,6 @@ static void post_worker(void *data, long seq_id, int t_id) {
 			std::push_heap(heap.begin(), heap.end());
 		}
 	}
-	return;
-	// fixme: what happens? why there are repetitive reads in the merged heap?
-	std::sort(heap.begin(), heap.end(), [&] (const RepRead &a, const RepRead &b) -> bool { return a.read < b.read; });
-	for (int i = 1; i < heap.size(); i++) {
-		if (heap[i-1].read == heap[i].read) {
-			fprintf(stderr, "%s %d\n", heap[i-1].read.c_str(), heap[i-1].occ);
-			fprintf(stderr, "%s %d\n", heap[i].read.c_str(), heap[i].occ);
-		}
-		assert(heap[i-1].read != heap[i].read);
-	}
 }
 
 static void heap_down(std::vector<RepRead> &a, const RepRead &r) {
@@ -447,14 +438,14 @@ void pickup_frequent(const Option *opt, Trie **trie_counter, const int32_t *em_c
 	delete [] w.heaps;
 
 	// Sanity check
-	std::sort(heap.begin(), heap.end(), [&] (const RepRead &a, const RepRead &b) -> bool { return a.read < b.read; });
-	for (int i = 1; i < heap.size(); i++) {
-		if (heap[i-1].read == heap[i].read) {
-			fprintf(stderr, "%s %d\n", heap[i-1].read.c_str(), heap[i-1].occ);
-			fprintf(stderr, "%s %d\n", heap[i].read.c_str(), heap[i].occ);
-		}
-		assert(heap[i-1].read != heap[i].read);
-	}
+//	std::sort(heap.begin(), heap.end(), [&] (const RepRead &a, const RepRead &b) -> bool { return a.read < b.read; });
+//	for (int i = 1; i < heap.size(); i++) {
+//		if (heap[i-1].read == heap[i].read) {
+//			fprintf(stderr, "%s %d\n", heap[i-1].read.c_str(), heap[i-1].occ);
+//			fprintf(stderr, "%s %d\n", heap[i].read.c_str(), heap[i].occ);
+//		}
+//		assert(heap[i-1].read != heap[i].read);
+//	}
 
 	int k = opt->most_rep;
 	for (int64_t i = 0; i < ref_len - read_length_monitor; i++) {
