@@ -375,7 +375,7 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 }
 
 /** Post-processing */
-static void post_worker1(void *data, long seq_id, int t_id) {
+static void post_worker(void *data, long seq_id, int t_id) {
 	auto *w = (worker_t*) data;
 	auto &heap = w->heaps[t_id];
 	auto *trie_counter = w->trie_counter[seq_id];
@@ -392,37 +392,33 @@ static void post_worker1(void *data, long seq_id, int t_id) {
 			std::push_heap(heap.begin(), heap.end());
 		}
 	}
+	return;
+	// fixme: what happens? why there are repetitive reads in the merged heap?
+	std::sort(heap.begin(), heap.end(), [&] (const RepRead &a, const RepRead &b) -> bool { return a.read < b.read; });
+	for (int i = 1; i < heap.size(); i++) {
+		if (heap[i-1].read == heap[i].read) {
+			fprintf(stderr, "%s %d\n", heap[i-1].read.c_str(), heap[i-1].occ);
+			fprintf(stderr, "%s %d\n", heap[i].read.c_str(), heap[i].occ);
+		}
+		assert(heap[i-1].read != heap[i].read);
+	}
 }
 
-#define GRANULARITY 10000000
-static void post_worker2(void *data, long seq_id, int t_id) {
-	auto *w = (worker_t*) data;
-	auto &heap = w->heaps[t_id];
-	const int32_t *em_counter = w->em_counter;
-	const uint8_t *ref_seq = w->ref_seq;
-	int k = w->opt->most_rep;
-	int64_t start = seq_id * GRANULARITY;
-	int64_t end = std::min(w->ref_len - read_length_monitor, start + GRANULARITY);
-	for (int64_t i = start; i < end; i++) {
-		RepRead r;
-		r.occ = em_counter[i];
-		if (heap.size() < k or r.occ > heap[0].occ) {
-			r.read.resize(read_length_monitor);
-			for (int j = 0; j < read_length_monitor; j++) r.read[j] = "ACGT"[ref_seq[i + j]];
-		}
-		if (heap.size() < k) {
-			heap.push_back(r);
-			std::push_heap(heap.begin(), heap.end());
-		} else if (r.occ > heap[0].occ) {
-			std::pop_heap(heap.begin(), heap.end());
-			heap.back() = r;
-			std::push_heap(heap.begin(), heap.end());
-		}
+static void heap_down(std::vector<RepRead> &a, const RepRead &r) {
+	a[0] = r;
+	int p = 0;
+	while (p < a.size()) {
+		int lc = p * 2 + 1;
+		if (lc >= a.size()) break;
+		int rc = lc + 1;
+		int c = rc < a.size() and a[lc] < a[rc] ?lc :rc; // Choose the smaller child to compare
+		if (a[c] < a[p]) std::swap(a[c], a[p]); // Move down the bigger parent
+		else break;
+		p = c;
 	}
 }
 
 void pickup_frequent(const Option *opt, Trie **trie_counter, const int32_t *em_counter, int64_t ref_len, const uint8_t *ref_seq) {
-	double t_real, t_cpu;
 	if (opt->most_rep <= 0) return ;
 	worker_t w;
 	w.opt = opt;
@@ -431,37 +427,8 @@ void pickup_frequent(const Option *opt, Trie **trie_counter, const int32_t *em_c
 	w.heaps = new std::vector<RepRead>[opt->n_threads];
 	w.ref_seq = ref_seq;
 	w.ref_len = ref_len;
-	t_real = realtime(); t_cpu = cputime();
-	kt_for(opt->n_threads, post_worker1, &w, TRIE_BUCKET_SIZE);
-	fprintf(stderr, "post_worker1: %.2f real seconds, %.2f CPU seconds\n", realtime() - t_real, cputime() - t_cpu);
 
-	// A big granularity can alleviate the overhead inflicted by fetch-and-add().
-	// But the time cost of building threads still offset the parallelism.
-	t_real = realtime(); t_cpu = cputime();
-	kt_for(opt->n_threads, post_worker2, &w, (ref_len + GRANULARITY - 1) / GRANULARITY);
-//	{
-//		// kt-for is slower than linear scanning
-//		std::vector<RepRead> &heap = w.heaps[0];
-//		int k = opt->most_rep;
-//		for (int64_t seq_id = 0; seq_id < ref_len - read_length_monitor; seq_id++) {
-//			RepRead r;
-//			r.occ = em_counter[seq_id];
-//			if (heap.size() < k or r.occ > heap[0].occ) {
-//				r.read.resize(read_length_monitor);
-//				for (int j = 0; j < read_length_monitor; j++) r.read[j] = "ACGT"[ref_seq[seq_id + j]];
-//			}
-//			if (heap.size() < k) {
-//				heap.push_back(r);
-//				std::push_heap(heap.begin(), heap.end());
-//			} else if (r.occ > heap[0].occ) {
-//				std::pop_heap(heap.begin(), heap.end());
-//				heap.back() = r;
-//				std::push_heap(heap.begin(), heap.end());
-//			}
-//		}
-//	}
-	fprintf(stderr, "post_worker2: %.2f real seconds, %.2f CPU seconds\n", realtime() - t_real, cputime() - t_cpu);
-
+	kt_for(opt->n_threads, post_worker, &w, TRIE_BUCKET_SIZE);
 	// Congregate results
 	std::vector<RepRead> heap = w.heaps[0];
 	for (int i = 1; i < opt->n_threads; i++)  {
@@ -478,6 +445,35 @@ void pickup_frequent(const Option *opt, Trie **trie_counter, const int32_t *em_c
 		}
 	}
 	delete [] w.heaps;
+
+	// Sanity check
+	std::sort(heap.begin(), heap.end(), [&] (const RepRead &a, const RepRead &b) -> bool { return a.read < b.read; });
+	for (int i = 1; i < heap.size(); i++) {
+		if (heap[i-1].read == heap[i].read) {
+			fprintf(stderr, "%s %d\n", heap[i-1].read.c_str(), heap[i-1].occ);
+			fprintf(stderr, "%s %d\n", heap[i].read.c_str(), heap[i].occ);
+		}
+		assert(heap[i-1].read != heap[i].read);
+	}
+
+	int k = opt->most_rep;
+	for (int64_t i = 0; i < ref_len - read_length_monitor; i++) {
+		if (em_counter[i] == 0) continue;
+		RepRead r;
+		r.occ = em_counter[i];
+		if (heap.size() < k or r.occ > heap[0].occ) {
+			r.read.resize(read_length_monitor);
+			for (int j = 0; j < read_length_monitor; j++) r.read[j] = "ACGT"[ref_seq[i + j]];
+		}
+		if (heap.size() < k) {
+			heap.push_back(r);
+			std::push_heap(heap.begin(), heap.end());
+		} else if (r.occ > heap[0].occ) {
+			std::pop_heap(heap.begin(), heap.end());
+			heap.back() = r;
+			std::push_heap(heap.begin(), heap.end());
+		}
+	}
 
 	std::sort(heap.begin(), heap.end());
 	fprintf(stderr, "The %d most frequent read:\n", opt->most_rep);
