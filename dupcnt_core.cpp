@@ -216,6 +216,7 @@ typedef struct {
 	const int32_t *em_counter;
 	const Option *opt;
 	const uint8_t *ref_seq;
+	int64_t ref_len;
 } worker_t ;
 
 void exact_matching(void *_data, long seq_id, int t_id) {
@@ -393,26 +394,30 @@ static void post_worker1(void *data, long seq_id, int t_id) {
 	}
 }
 
+#define GRANULARITY 10000000
 static void post_worker2(void *data, long seq_id, int t_id) {
 	auto *w = (worker_t*) data;
 	auto &heap = w->heaps[t_id];
 	const int32_t *em_counter = w->em_counter;
 	const uint8_t *ref_seq = w->ref_seq;
 	int k = w->opt->most_rep;
-
-	RepRead r;
-	r.occ = em_counter[seq_id];
-	if (heap.size() < k or r.occ > heap[0].occ) {
-		r.read.resize(read_length_monitor);
-		for (int j = 0; j < read_length_monitor; j++) r.read[j] = "ACGT"[ref_seq[seq_id + j]];
-	}
-	if (heap.size() < k) {
-		heap.push_back(r);
-		std::push_heap(heap.begin(), heap.end());
-	} else if (r.occ > heap[0].occ) {
-		std::pop_heap(heap.begin(), heap.end());
-		heap.back() = r;
-		std::push_heap(heap.begin(), heap.end());
+	int64_t start = seq_id * GRANULARITY;
+	int64_t end = std::min(w->ref_len - read_length_monitor, start + GRANULARITY);
+	for (int64_t i = start; i < end; i++) {
+		RepRead r;
+		r.occ = em_counter[i];
+		if (heap.size() < k or r.occ > heap[0].occ) {
+			r.read.resize(read_length_monitor);
+			for (int j = 0; j < read_length_monitor; j++) r.read[j] = "ACGT"[ref_seq[i + j]];
+		}
+		if (heap.size() < k) {
+			heap.push_back(r);
+			std::push_heap(heap.begin(), heap.end());
+		} else if (r.occ > heap[0].occ) {
+			std::pop_heap(heap.begin(), heap.end());
+			heap.back() = r;
+			std::push_heap(heap.begin(), heap.end());
+		}
 	}
 }
 
@@ -425,9 +430,37 @@ void pickup_frequent(const Option *opt, Trie **trie_counter, const int32_t *em_c
 	w.em_counter = em_counter;
 	w.heaps = new std::vector<RepRead>[opt->n_threads];
 	w.ref_seq = ref_seq;
+	w.ref_len = ref_len;
 	t_real = realtime(); t_cpu = cputime();
 	kt_for(opt->n_threads, post_worker1, &w, TRIE_BUCKET_SIZE);
 	fprintf(stderr, "post_worker1: %.2f real seconds, %.2f CPU seconds\n", realtime() - t_real, cputime() - t_cpu);
+
+	// A big granularity can alleviate the overhead inflicted by fetch-and-add().
+	// But the time cost of building threads still offset the parallelism.
+	t_real = realtime(); t_cpu = cputime();
+	kt_for(opt->n_threads, post_worker2, &w, (ref_len + GRANULARITY - 1) / GRANULARITY);
+//	{
+//		// kt-for is slower than linear scanning
+//		std::vector<RepRead> &heap = w.heaps[0];
+//		int k = opt->most_rep;
+//		for (int64_t seq_id = 0; seq_id < ref_len - read_length_monitor; seq_id++) {
+//			RepRead r;
+//			r.occ = em_counter[seq_id];
+//			if (heap.size() < k or r.occ > heap[0].occ) {
+//				r.read.resize(read_length_monitor);
+//				for (int j = 0; j < read_length_monitor; j++) r.read[j] = "ACGT"[ref_seq[seq_id + j]];
+//			}
+//			if (heap.size() < k) {
+//				heap.push_back(r);
+//				std::push_heap(heap.begin(), heap.end());
+//			} else if (r.occ > heap[0].occ) {
+//				std::pop_heap(heap.begin(), heap.end());
+//				heap.back() = r;
+//				std::push_heap(heap.begin(), heap.end());
+//			}
+//		}
+//	}
+	fprintf(stderr, "post_worker2: %.2f real seconds, %.2f CPU seconds\n", realtime() - t_real, cputime() - t_cpu);
 
 	// Congregate results
 	std::vector<RepRead> heap = w.heaps[0];
@@ -445,30 +478,6 @@ void pickup_frequent(const Option *opt, Trie **trie_counter, const int32_t *em_c
 		}
 	}
 	delete [] w.heaps;
-
-	t_real = realtime(); t_cpu = cputime();
-//	kt_for(opt->n_threads, post_worker2, &w, ref_len);
-	{
-		// kt-for is slower than linear scanning
-		int k = opt->most_rep;
-		for (int64_t seq_id; seq_id < ref_len - read_length_monitor; seq_id++) {
-			RepRead r;
-			r.occ = em_counter[seq_id];
-			if (heap.size() < k or r.occ > heap[0].occ) {
-				r.read.resize(read_length_monitor);
-				for (int j = 0; j < read_length_monitor; j++) r.read[j] = "ACGT"[ref_seq[seq_id + j]];
-			}
-			if (heap.size() < k) {
-				heap.push_back(r);
-				std::push_heap(heap.begin(), heap.end());
-			} else if (r.occ > heap[0].occ) {
-				std::pop_heap(heap.begin(), heap.end());
-				heap.back() = r;
-				std::push_heap(heap.begin(), heap.end());
-			}
-		}
-	}
-	fprintf(stderr, "post_worker2: %.2f real seconds, %.2f CPU seconds\n", realtime() - t_real, cputime() - t_cpu);
 
 	std::sort(heap.begin(), heap.end());
 	fprintf(stderr, "The %d most frequent read:\n", opt->most_rep);
