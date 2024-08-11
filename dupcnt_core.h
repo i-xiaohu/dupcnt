@@ -36,6 +36,7 @@ struct RepRead {
 
 class Trie {
 private:
+	uint32_t bucket_id; /** Identifier of trie from 0 to 4096 */
 	std::vector<TrNode> nodes; /** Nodes in the trie */
 
 public:
@@ -43,7 +44,7 @@ public:
 	bool overflow;
 
 	/** Construction: init root node */
-	Trie();
+	Trie(uint32_t bid);
 
 	/** Add a read into the trie that the first 6 bases of read are omitted and the occurrence
 	 * numbers of leaves (reads) are recorded.
@@ -52,19 +53,26 @@ public:
 	 */
 	void add_read(int n, const char *s);
 
+	/** Return the occurrence number of most repetitive read. */
 	int get_max_occ();
 
+	/** Delete light-weight nodes to half the trie size. */
 	void auto_adjust_size();
 
+	/** Virtual memory size. */
 	size_t get_size() { return nodes.capacity() * sizeof(TrNode); }
 
-	std::vector<RepRead> most_k_frequent(uint32_t bucket_id, int k);
+	/** Return the most k repetitive reads using minimum heap. */
+	std::vector<RepRead> most_k_frequent( int k);
+
+	/** Append reads that appears more than once in the tire to $reads. */
+	void fetch_rep_read(std::vector<RepRead> &reads);
 };
 
 struct Option {
 	int n_threads = 16;
 	int batch_size = 10 * 1000 * 1000; // 10M bases for each thread
-	int most_rep = 0;
+	long most_rep = 0;
 	const char *index_prefix = nullptr;
 	size_t mem_cap = 100L * 1024L * 1024L * 1024L; // 100GB
 };

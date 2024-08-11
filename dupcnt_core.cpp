@@ -20,7 +20,8 @@ int read_length_monitor = -1; // To avoid any read of different length
 #include "bwalib/kseq.h"
 KSEQ_INIT(gzFile, gzread)
 
-Trie::Trie() {
+Trie::Trie(uint32_t bid) {
+	bucket_id = bid;
 	unique_n = 0;
 	overflow = false;
 	nodes.clear();
@@ -143,7 +144,7 @@ struct Tuple {
 	Tuple(int n, int d, int l) : node_id(n), depth(d), label(l) {}
 };
 
-std::vector<RepRead> Trie::most_k_frequent(uint32_t bucket_id, int k) {
+std::vector<RepRead> Trie::most_k_frequent(int k) {
 	std::vector<RepRead> heap;
 	char seq[read_length_monitor + 1];
 	seq[read_length_monitor] = '\0';
@@ -183,6 +184,37 @@ std::vector<RepRead> Trie::most_k_frequent(uint32_t bucket_id, int k) {
 	}
 
 	return heap;
+}
+
+void Trie::fetch_rep_read(std::vector<RepRead> &reads) {
+	char seq[read_length_monitor + 1];
+	seq[read_length_monitor] = '\0';
+	std::stack<Tuple> st;
+	for (int l = 3; l >= 0; l--) { // Preorder
+		int c = nodes[0].x[l];
+		if (c) st.push(Tuple(c, TRIE_SHIFT, l));
+	}
+	for (int i = TRIE_SHIFT-1; i >= 0; i--) {
+		seq[i] = "ACGT"[bucket_id & 3U];
+		bucket_id >>= 2U;
+	}
+
+	while (not st.empty()) {
+		auto t = st.top();
+		st.pop();
+		seq[t.depth] = "ACGT"[t.label];
+		if (t.depth == read_length_monitor - 1) { // Leaf layer
+			RepRead r;
+			r.occ = nodes[t.node_id].x[0];
+			r.read = std::string(seq);
+			reads.push_back(r);
+		} else {
+			for (int l = 3; l >= 0; l--) {
+				int c = nodes[t.node_id].x[l];
+				if (c) st.push(Tuple(c, t.depth + 1, l));
+			}
+		}
+	}
 }
 
 double realtime()
@@ -381,7 +413,7 @@ static void post_worker(void *data, long seq_id, int t_id) {
 	auto &heap = w->heaps[t_id];
 	auto *trie_counter = w->trie_counter[seq_id];
 	int k = w->opt->most_rep;
-	auto sub_heap = trie_counter->most_k_frequent(seq_id, k);
+	auto sub_heap = trie_counter->most_k_frequent(k);
 	for (auto &r : sub_heap) {
 		if (heap.size() < k) {
 			heap.push_back(r);
@@ -410,7 +442,6 @@ static void heap_down(std::vector<RepRead> &a, const RepRead &r) {
 }
 
 void pickup_frequent(const Option *opt, Trie **trie_counter, const int32_t *em_counter, int64_t ref_len, const uint8_t *ref_seq) {
-	if (opt->most_rep <= 0) return ;
 	worker_t w;
 	w.opt = opt;
 	w.trie_counter = trie_counter;
@@ -467,15 +498,38 @@ void pickup_frequent(const Option *opt, Trie **trie_counter, const int32_t *em_c
 	}
 
 	std::sort(heap.begin(), heap.end());
-	fprintf(stderr, "The %d most frequent read:\n", opt->most_rep);
+	fprintf(stderr, "The %ld most frequent read:\n", opt->most_rep);
 	for (auto &r : heap) {
 		fprintf(stderr, "  %s %d\n", r.read.c_str(), r.occ);
 	}
 	fprintf(stderr, "\n");
 }
 
+void stat_occ(Trie **trie_counter, const int32_t *em_counter, int64_t ref_len, const uint8_t *ref_seq) {
+	std::vector<RepRead> reads;
+	for (int i = 0; i < TRIE_BUCKET_SIZE; i++) {
+		trie_counter[i]->fetch_rep_read(reads);
+	}
+
+	for (int64_t i = 0; i < ref_len - read_length_monitor; i++) {
+		if (em_counter[i] == 0) continue;
+		RepRead r;
+		r.occ = em_counter[i];
+		r.read.resize(read_length_monitor);
+		for (int j = 0; j < read_length_monitor; j++) r.read[j] = "ACGT"[ref_seq[i + j]];
+		reads.push_back(r);
+	}
+
+	std::sort(reads.begin(), reads.end());
+	fprintf(stderr, "There are %ld reads appearing more than once:\n", reads.size());
+	for (const auto &r : reads) {
+		fprintf(stderr, "  %s %d\n", r.read.c_str(), r.occ);
+	}
+	fprintf(stderr, "\n");
+}
+
 void process(const Option *opt, int n_sample, char *files[]) {
-	/* FM-index from BWA-MEM; todo: do consider switch to BWA-MEM2 index */
+	/* FM-index from BWA-MEM  */
 	bwaidx_t *idx = bwa_idx_load_from_shm(opt->index_prefix);
 	if (idx == nullptr) {
 		if ((idx = bwa_idx_load(opt->index_prefix, BWA_IDX_ALL)) == nullptr) {
@@ -495,7 +549,7 @@ void process(const Option *opt, int n_sample, char *files[]) {
 	aux.em_counter = (int32_t*) calloc(ref_len, sizeof(int32_t));
 	aux.t_start = realtime();
 	aux.trie_counter = new Trie*[TRIE_BUCKET_SIZE];
-	for (int i = 0; i < TRIE_BUCKET_SIZE; i++) aux.trie_counter[i] = new Trie();
+	for (int i = 0; i < TRIE_BUCKET_SIZE; i++) aux.trie_counter[i] = new Trie(i);
 	aux.unmatched_seqs = new std::vector<bseq1_t>[TRIE_BUCKET_SIZE];
 	aux.oversize_n = 0;
 
@@ -534,8 +588,12 @@ void process(const Option *opt, int n_sample, char *files[]) {
 	}
 
 	double t_start = realtime(), t_cpu = cputime();
-	pickup_frequent(opt, aux.trie_counter, aux.em_counter, ref_len, ref_seq);
-	fprintf(stderr, "Post processing %.2f CPU seconds, %.2f real seconds\n", realtime() - t_start, cputime() - t_cpu);
+	if (opt->most_rep > 0) {
+		pickup_frequent(opt, aux.trie_counter, aux.em_counter, ref_len, ref_seq);
+	} else if (opt->most_rep == -1) {
+		stat_occ(aux.trie_counter, aux.em_counter, ref_len, ref_seq);
+	}
+	fprintf(stderr, "Post processing %.2f Real seconds, %.2f CPU seconds\n", realtime() - t_start, cputime() - t_cpu);
 
 	free(ref_seq);
 	bwa_idx_destroy(idx);

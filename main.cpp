@@ -15,7 +15,7 @@ int usage() {
 	fprintf(stderr ,"  -i <STR> Index prefix\n");
 	fprintf(stderr, "  -k <INT> Batch size\n");
 	fprintf(stderr, "  -c <STR> Trie memory usage upperbound [100G]\n");
-	fprintf(stderr, "  -j <INT> Output the most p frequent reads [0]\n");
+	fprintf(stderr, "  -j <INT> Output the most p frequent reads [0] (-1 to print all reads with occurrence number > 1)\n");
 	return 1;
 }
 
@@ -45,7 +45,7 @@ int main(int argc, char *argv[]) {
 				}
 			}
 		} else if (c == 'j') {
-			opt->most_rep = atoi(optarg);
+			opt->most_rep = atol(optarg);
 		} else {
 			fprintf(stderr, "Unrecognized option `-%c`\n", c);
 			free(opt);

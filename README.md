@@ -18,7 +18,7 @@ impact on the overall result.
 - `-t` Number of threads (16 by default)
 - `-c` Trie maximum size to curb memory consumption (100GB by default, but needing ~150GB in practice)
 - `-k` Input batch size (10M)
-- `-j` Output the most p frequent reads
+- `-j` Output the most p frequent reads (0 by default, -1 to print all reads appearing more than once)
 
 # Result
 *dupcnt* outputs time profile after each batch. Trie is super fast and well parallelized (64 threads used here).
