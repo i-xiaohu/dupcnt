@@ -93,7 +93,7 @@ void Trie::auto_adjust_size() {
 		}
 		// Sort by frequency
 		std::sort(prev.begin(), prev.end(),
-			[&](int a, int b) -> bool { return nodes[a].x[0] > nodes[b].x[0]; }
+		          [&](int a, int b) -> bool { return nodes[a].x[0] > nodes[b].x[0]; }
 		);
 		kept[0] = true;
 		kept_n = 1;
@@ -211,7 +211,7 @@ void Trie::fetch_rep_read(std::vector<RepRead> &reads) {
 		} else {
 			for (int l = 3; l >= 0; l--) {
 				int c = nodes[t.node_id].x[l];
-				if (c) st.push(Tuple(c, t.depth + 1, l));
+				if (c > 1) st.push(Tuple(c, t.depth + 1, l));
 			}
 		}
 	}
@@ -337,12 +337,23 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 				fprintf(stderr, "Only fix-length reads are supported\n");
 				std::abort();
 			}
-			// Convert non-ACGT to A
+			std::string r1, r2;
+			r1.resize(read_length_monitor);
+			r2.resize(read_length_monitor);
 			for (int k = 0; k < b->l_seq; k++) {
 				b->seq[k] = nst_nt4_table[(uint8_t)b->seq[k]];
-				if (b->seq[k] > 3) b->seq[k] = 0;
+				if (b->seq[k] > 3) b->seq[k] = 0; // Convert non-ACGT to A
 			}
-			// todo: strand correction heuristic
+			for (int k = 0; k < b->l_seq; k++) {
+				r1[k] = "ACGT"[b->seq[k]];
+				r2[b->l_seq - 1 - k] = "ACGT"[3 - b->seq[k]];
+			}
+			if (r1 > r2) {
+				// Choose the lexicographically smaller one
+				for (int k = 0; k < b->l_seq; k++) {
+					b->seq[k] = nst_nt4_table[(uint8_t)r2[k]];
+				}
+			}
 		}
 		aux->t_input += realtime() - t_start;
 		return ret;
@@ -512,12 +523,13 @@ void stat_occ(Trie **trie_counter, const int32_t *em_counter, int64_t ref_len, c
 	}
 
 	for (int64_t i = 0; i < ref_len - read_length_monitor; i++) {
-		if (em_counter[i] == 0) continue;
-		RepRead r;
-		r.occ = em_counter[i];
-		r.read.resize(read_length_monitor);
-		for (int j = 0; j < read_length_monitor; j++) r.read[j] = "ACGT"[ref_seq[i + j]];
-		reads.push_back(r);
+		if (em_counter[i] > 1) {
+			RepRead r;
+			r.occ = em_counter[i];
+			r.read.resize(read_length_monitor);
+			for (int j = 0; j < read_length_monitor; j++) r.read[j] = "ACGT"[ref_seq[i + j]];
+			reads.push_back(r);
+		}
 	}
 
 	std::sort(reads.begin(), reads.end());
