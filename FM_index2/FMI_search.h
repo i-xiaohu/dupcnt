@@ -39,7 +39,7 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include <fstream>
 
 #include "read_index_ele.h"
-#include "../bwalib/bwa.h"
+#include "bseq1.h"
 
 #define DUMMY_CHAR 6
 

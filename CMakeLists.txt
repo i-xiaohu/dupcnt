@@ -15,13 +15,11 @@ set(cstl
 
 set(bwalib
         bwalib/kseq.h
-        bwalib/bwashm.c
-        bwalib/bwa.c bwalib/bwa.h
         bwalib/kopen.c bwalib/kopen.h
-        bwalib/ksw.c bwalib/ksw.h
         bwalib/utils.c bwalib/utils.h)
 
 set(FM_index2
+        FM_index2/bseq1.h
         FM_index2/FMI_search.cpp FM_index2/FMI_search.h
         FM_index2/read_index_ele.cpp FM_index2/read_index_ele.h
         FM_index2/bntseq.cpp FM_index2/bntseq.h

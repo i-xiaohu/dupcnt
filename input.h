@@ -7,7 +7,7 @@
 
 // todo: Input function is confusing, code cleanup needed.
 
-#include "bwalib/bwa.h"
+#include "FM_index2/bseq1.h"
 
 bseq1_t *bseq_read(int chunk_size, int *n_, void *ks1_, void *ks2_);
 
