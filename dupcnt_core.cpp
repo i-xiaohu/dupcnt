@@ -7,18 +7,35 @@
 #include <cstring>
 #include <string>
 #include <cassert>
-#include <sys/time.h>
-#include <algorithm>
-#include <sys/resource.h>
 #include <stack>
 #include "dupcnt_core.h"
 #include "cstl/kthread.h"
 #include "FM_index2/FMI_search.h"
 #include "input.h"
+#include "kavl.h"
+#include "kalloc.h"
 #include "bwalib/kseq.h"
 KSEQ_INIT(gzFile, gzread)
 
 int read_length_monitor = -1; // To avoid any read of different length
+#define PACK_SIZE 4
+
+typedef struct read_node_s {
+	uint8_t *packed; // Sequence packed with 2-bit encoding
+	int32_t count; // Occurrence number of read
+	KAVL_HEAD(struct read_node_s) head;
+} read_node_t;
+
+inline int read_node_cmp(const read_node_t *a, const read_node_t *b) {
+	int pack_len = (read_length_monitor - AVL_SHIFT + PACK_SIZE - 1) / PACK_SIZE;
+	for (int i = 0; i < pack_len; i++) {
+		if (a->packed[i] < b->packed[i]) return -1;
+		else if (a->packed[i] > b->packed[i]) return 1;
+	}
+	return 0;
+}
+#define macro_node_cmp(a, b) (read_node_cmp(a, b))
+KAVL_INIT(rn, read_node_t, head, macro_node_cmp)
 
 typedef struct {
 	const Option *opt;
@@ -28,6 +45,9 @@ typedef struct {
 	int64_t *match_pos; // -1 for unmatched reads
 	int32_t *em_counter; // em_counter[i]: count of reads matched at the position i
 	std::vector<bseq1_t> *unmatched_seqs; // Unmatched reads are distributed to different buckets
+	void **km; // Memory block for each thread
+	read_node_t **roots; // AVL trees
+	int32_t *tree_counter; // Unique reads found in binary trees
 	int32_t sample_id; // Current sample
 	int32_t batch_id; // Current batch
 	int64_t n_sample_seqs; // Total number of input reads
@@ -36,13 +56,7 @@ typedef struct {
 	double t_input, t_match, t_avl; // Wall clock time of each stage
 } ktp_aux_t;
 
-static inline void bseq1_destroy(const bseq1_t *b) {
-	free(b->name);
-	free(b->comment);
-	free(b->seq);
-	free(b->qual);
-}
-
+/** Step1: Find all exactly matched reads */
 void exact_matching(void *_data, long seq_id, int t_id) {
 	auto *w = (ktp_aux_t*)_data;
 	FMI_search *fmi = w->fmi;
@@ -66,6 +80,42 @@ void exact_matching(void *_data, long seq_id, int t_id) {
 	} else {
 		w->match_pos[seq_id] = -1;
 	}
+}
+
+/** Step2: Use AVL to process unmatched reads */
+void avl_search(void *_data, long seq_id, int t_id) {
+	auto *w = (ktp_aux_t*)_data;
+	void *km = w->km[t_id];
+	read_node_t *root = w->roots[seq_id];
+	auto &reads = w->unmatched_seqs[seq_id];
+
+	for (auto &b : reads) {
+		read_node_t *r;
+		KCALLOC(km, r, 1);
+		int32_t pack_len = (b.l_seq - AVL_SHIFT + PACK_SIZE - 1) / PACK_SIZE;
+		KMALLOC(km, r->packed, pack_len);
+		for (int i = 0, k = AVL_SHIFT; i < pack_len; i++) {
+			uint8_t x = 0;
+			for (int j = 0; j < PACK_SIZE; j++) {
+				x <<= 2U;
+				x |= (k < b.l_seq ?b.seq[k] :0U);
+				k++;
+			}
+			r->packed[i] = x;
+		}
+		read_node_t *t = kavl_size(head, root) > 0 ?kavl_find(rn, root, r, NULL) :NULL;
+		if (t) {
+			t->count++;
+			kfree(km, r->packed);
+			kfree(km, r);
+		} else {
+			kavl_insert(rn, &root, r, NULL);
+			w->tree_counter[t_id]++;
+		}
+		bseq1_destroy(&b); // Unmatched reads are deallocated here
+	}
+	w->roots[seq_id] = root; // Remember root may change
+	reads.clear(); // Clear the vector at each call
 }
 
 typedef struct {
@@ -128,9 +178,7 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 		for (int i = 0; i < data->n_seqs; i++) {
 			int64_t pos = aux->match_pos[i];
 			if (pos != -1) {
-				if (pos >= aux->fmi->reference_seq_len) {
-					fprintf(stderr, "%ld\n", pos);
-				}
+				// Read appears at the position for the first time
 				if (aux->em_counter[pos] == 0) aux->n_unique++;
 				aux->em_counter[pos]++;
 			} else {
@@ -149,7 +197,20 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 		aux->t_match += t_end - t_start;
 		cpu_ratio1 = (c_end - c_start) / (t_end - t_start);
 
-		// 2. Process unmatched reads using trie
+		// 2. Process unmatched reads using AVL tree
+		t_start = realtime(); c_start = cputime();
+		for (int i = 0; i < opt->n_threads; i++) aux->tree_counter[i] = 0;
+		kt_for(opt->n_threads, avl_search, aux, AVL_BUCKET);
+		for (int i = 0; i < opt->n_threads; i++) aux->n_unique += aux->tree_counter[i];
+		t_end = realtime(); c_end = cputime();
+		aux->t_avl += t_end - t_start;
+		cpu_ratio2 = (c_end - c_start) / (t_end - t_start);
+
+		fprintf(stderr, "[Sample %d Batch %d] %ld reads processed; (Input %.2f, Match %.2f, AVL%.2f); Match %.2f; AVL%.2f\n",
+		        aux->sample_id, aux->batch_id++, aux->n_sample_seqs,
+		        aux->t_input, aux->t_match, aux->t_avl,
+		        cpu_ratio1, cpu_ratio2);
+
 		free(data->seqs);
 		free(data);
 		return NULL;
@@ -162,14 +223,16 @@ void process(const Option *opt, int n_sample, char *files[]) {
 	/* FM-index from BWA-MEM2  */
 	auto *fmi = new FMI_search(opt->index_prefix);
 	fmi->load_index();
-	int64_t ref_len = fmi->idx->bns->l_pac * 2;
-	fprintf(stderr, "Reference length: %ld\n", ref_len);
 
 	ktp_aux_t aux;
 	aux.opt = opt;
 	aux.fmi = fmi;
-	aux.em_counter = (int32_t*) calloc(ref_len + 1, sizeof(int32_t));
+	aux.em_counter = (int32_t*) calloc(fmi->reference_seq_len + 1, sizeof(int32_t));
 	aux.unmatched_seqs = new std::vector<bseq1_t>[AVL_BUCKET];
+	aux.km = (void**) malloc(opt->n_threads * sizeof(void*));
+	for (int i = 0; i < opt->n_threads; i++) aux.km[i] = km_init();
+	aux.roots = (read_node_t**) calloc(AVL_BUCKET, sizeof(read_node_t*));
+	aux.tree_counter = (int32_t*) calloc(opt->n_threads, sizeof(int32_t));
 	aux.n_sample_seqs = 0;
 	aux.n_matched_seqs = 0;
 	aux.n_unique = 0;
@@ -201,4 +264,8 @@ void process(const Option *opt, int n_sample, char *files[]) {
 	delete fmi;
 	free(aux.em_counter);
 	delete [] aux.unmatched_seqs;
+	for (int i = 0; i < opt->n_threads; i++) km_destroy(aux.km[i]);
+	free(aux.km);
+	free(aux.roots);
+	free(aux.tree_counter);
 }

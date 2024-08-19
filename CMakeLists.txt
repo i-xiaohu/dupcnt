@@ -29,10 +29,12 @@ add_executable(mem2idx ${FM_index2} bwalib/utils.c bwalib/utils.h FM_index2/inde
 target_link_libraries(mem2idx -lz -lrt)
 
 add_executable(dupcnt
+        ${cstl}
         ${FM_index2}
         bwalib/utils.c  bwalib/utils.h
+        kalloc.c kalloc.h
+        kavl.h
         input.cpp input.h
-        ${cstl}
         dupcnt_core.cpp
         dupcnt_core.h
         main.cpp )
