@@ -10,21 +10,8 @@
 #include <vector>
 #include <string>
 
-/**
- * The first 6 bases of reads are used to distributed to 4^6 = 4096 tries.
- * Each trie has a maximum of 1,953,125 nodes.
- * If trie is oversized, some nodes and paths will be removed to restrict memory usage.
- **/
-
-#define TRIE_SHIFT        6
-#define TRIE_BUCKET_SIZE  4096
-#define TRIE_SIZE_CAP     1953125
-
-struct TrNode {
-	// x[c] = 0 suggest no child down from branch c
-	// It is correct since root node always occupies the index of 0
-	int32_t x[4] = {0};
-};
+#define AVL_SHIFT  6
+#define AVL_BUCKET 4096
 
 struct RepRead {
 	int occ;
@@ -32,41 +19,6 @@ struct RepRead {
 	bool operator < (const RepRead &r) const {
 		return occ > r.occ; // Put less frequent read at the top of heap
 	}
-};
-
-class Trie {
-private:
-	uint32_t bucket_id; /** Identifier of trie from 0 to 4096 */
-	std::vector<TrNode> nodes; /** Nodes in the trie */
-
-public:
-	int unique_n; // Leaf nodes (size of read SET)
-	bool overflow;
-
-	/** Construction: init root node */
-	Trie(uint32_t bid);
-
-	/** Add a read into the trie that the first 6 bases of read are omitted and the occurrence
-	 * numbers of leaves (reads) are recorded.
-	 * @param n  read length
-	 * @param s  2-bit encoded sequence
-	 */
-	void add_read(int n, const char *s);
-
-	/** Return the occurrence number of most repetitive read. */
-	int get_max_occ();
-
-	/** Delete light-weight nodes to half the trie size. */
-	void auto_adjust_size();
-
-	/** Virtual memory size. */
-	size_t get_size() { return nodes.capacity() * sizeof(TrNode); }
-
-	/** Return the most k repetitive reads using minimum heap. */
-	std::vector<RepRead> most_k_frequent( int k);
-
-	/** Append reads that appears more than once in the tire to $reads. */
-	void fetch_rep_read(std::vector<RepRead> &reads);
 };
 
 struct Option {

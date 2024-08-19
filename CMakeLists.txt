@@ -13,15 +13,6 @@ set(cstl
         cstl/kstring.c cstl/kstring.h
         cstl/kthread.c cstl/kthread.h)
 
-set(FM_index
-        FM_index/bntseq.c FM_index/bntseq.h
-        FM_index/bwt.c FM_index/bwt.h
-        FM_index/bwt_gen.c
-        FM_index/is.c
-        FM_index/QSufSort.c FM_index/QSufSort.h
-        FM_index/rle.c FM_index/rle.h
-        FM_index/rope.c FM_index/rope.h)
-
 set(bwalib
         bwalib/kseq.h
         bwalib/bwashm.c
@@ -30,12 +21,19 @@ set(bwalib
         bwalib/ksw.c bwalib/ksw.h
         bwalib/utils.c bwalib/utils.h)
 
-add_executable(bwaidx ${FM_index} ${bwalib} FM_index/index_main.c)
-target_link_libraries(bwaidx -lz -lrt)
+set(FM_index2
+        FM_index2/FMI_search.cpp FM_index2/FMI_search.h
+        FM_index2/read_index_ele.cpp FM_index2/read_index_ele.h
+        FM_index2/bntseq.cpp FM_index2/bntseq.h
+        FM_index2/sais.h)
+
+add_executable(mem2idx ${FM_index2} bwalib/utils.c bwalib/utils.h FM_index2/index_main.cpp)
+target_link_libraries(mem2idx -lz -lrt)
 
 add_executable(dupcnt
-        ${FM_index}
-        ${bwalib}
+        ${FM_index2}
+        bwalib/utils.c  bwalib/utils.h
+        input.cpp input.h
         ${cstl}
         dupcnt_core.cpp
         dupcnt_core.h
