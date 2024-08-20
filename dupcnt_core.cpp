@@ -8,6 +8,7 @@
 #include <string>
 #include <cassert>
 #include <stack>
+#include <queue>
 #include "dupcnt_core.h"
 #include "cstl/kthread.h"
 #include "FM_index2/FMI_search.h"
@@ -109,6 +110,7 @@ void avl_search(void *_data, long seq_id, int t_id) {
 			kfree(km, r->packed);
 			kfree(km, r);
 		} else {
+			r->count = 1;
 			kavl_insert(rn, &root, r, NULL);
 			w->tree_counter[t_id]++;
 		}
@@ -156,7 +158,6 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 				r2[b->l_seq - 1 - k] = "ACGT"[3 - b->seq[k]];
 			}
 			if (strcmp(r1, r2) > 0) {
-				// todo: check if something funny happens
 				// Choose the lexicographically smaller one
 				for (int k = 0; k < b->l_seq; k++) {
 					b->seq[k] = nst_nt4_table[(uint8_t)r2[k]];
@@ -206,7 +207,7 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 		aux->t_avl += t_end - t_start;
 		cpu_ratio2 = (c_end - c_start) / (t_end - t_start);
 
-		fprintf(stderr, "[Sample %d Batch %d] %ld reads processed; (Input %.2f, Match %.2f, AVL%.2f); Match %.2f; AVL%.2f\n",
+		fprintf(stderr, "[Sample %d Batch %d] %ld reads processed; (Input %.2f, Match %.2f, AVL %.2f); Match %.2f; AVL %.2f\n",
 		        aux->sample_id, aux->batch_id++, aux->n_sample_seqs,
 		        aux->t_input, aux->t_match, aux->t_avl,
 		        cpu_ratio1, cpu_ratio2);
@@ -218,16 +219,78 @@ static void *dual_pipeline(void *shared, int step, void *_data) {
 	return NULL;
 }
 
-/** Post-processing */
+
+void output(const ktp_aux_t *aux) {
+	const Option *opt = aux->opt;
+	const FMI_search *fmi = aux->fmi;
+	int64_t ref_len = fmi->reference_seq_len - 1; // Excluding sentinel
+	auto *ref_seq = (uint8_t*) malloc(ref_len * sizeof(uint8_t));
+	int32_t *em_counter = aux->em_counter;
+
+	{
+		// Load [prefix].0123
+		FILE *fp = fopen((std::string(opt->index_prefix) + ".0123").c_str(), "r");
+		assert(fp != nullptr);
+		fseek(fp, 0, SEEK_END);
+		int64_t filesize = ftell(fp);
+		assert(filesize == ref_len);
+		fseek(fp, 0, SEEK_SET);
+		fread(ref_seq, sizeof(uint8_t), ref_len, fp);
+		fclose(fp);
+	}
+
+	if (not opt->sorted) {
+		// Output exacted matched reads
+		char buf[read_length_monitor + 1];
+		buf[read_length_monitor] = '\0';
+		for (int i = 0; i < ref_len - read_length_monitor; i++) {
+			if (em_counter[i] > 1) {
+				memcpy(buf, ref_seq + i, read_length_monitor * sizeof(uint8_t));
+				for (int j = 0; j < read_length_monitor; j++) {
+					buf[j] = "ACGT"[buf[j]];
+				}
+				fprintf(stdout, "%s %d\n", buf, em_counter[i]);
+			}
+		}
+		// Output reads in AVL trees
+		for (int i = 0; i < AVL_BUCKET; i++) {
+			uint32_t x = i;
+			for (int j = AVL_SHIFT - 1; j >= 0; j--) {
+				buf[j] = "ACGT"[x & 3U];
+				x >>= 2U;
+			}
+			read_node_t *root = aux->roots[i];
+			std::queue<read_node_t*> que;
+			que.push(root);
+			while (not que.empty()) {
+				read_node_t *f = que.front();
+				que.pop();
+				if (f->count > 1) {
+					for (int j = 0; j < read_length_monitor - AVL_SHIFT; j++) {
+						uint8_t p = f->packed[j / PACK_SIZE];
+						uint8_t q = (p >> (2 * (3 - (j % PACK_SIZE)))) & 3U;
+						buf[j + AVL_SHIFT] = "ACGT"[q];
+					}
+					fprintf(stdout, "%s %d\n", buf, f->count);
+				}
+				if (f->head.p[0]) que.push(f->head.p[0]);
+				if (f->head.p[1]) que.push(f->head.p[1]);
+			}
+		}
+	}
+
+	free(ref_seq);
+}
+
 void process(const Option *opt, int n_sample, char *files[]) {
-	/* FM-index from BWA-MEM2  */
+	/* FM-index from BWA-MEM2 */
 	auto *fmi = new FMI_search(opt->index_prefix);
 	fmi->load_index();
 
 	ktp_aux_t aux;
 	aux.opt = opt;
 	aux.fmi = fmi;
-	aux.em_counter = (int32_t*) calloc(fmi->reference_seq_len + 1, sizeof(int32_t));
+	aux.em_counter = (int32_t*) calloc(fmi->reference_seq_len, sizeof(int32_t));
 	aux.unmatched_seqs = new std::vector<bseq1_t>[AVL_BUCKET];
 	aux.km = (void**) malloc(opt->n_threads * sizeof(void*));
 	for (int i = 0; i < opt->n_threads; i++) aux.km[i] = km_init();
@@ -251,7 +314,7 @@ void process(const Option *opt, int n_sample, char *files[]) {
 		kt_pipeline(2, dual_pipeline, &aux, 2);
 
 		fprintf(stderr, "%s added, %d sample(s) processed\n", files[i], i + 1);
-		fprintf(stderr, "  Time profile1(s):      Input %.2f; Match %.2f; Trie %.2f\n", aux.t_input, aux.t_match, aux.t_avl);
+		fprintf(stderr, "  Time profile1(s):      Input %.2f; Match %.2f; AVL %.2f\n", aux.t_input, aux.t_match, aux.t_avl);
 		fprintf(stderr, "  Number of reads:       %ld\n", aux.n_sample_seqs);
 		fprintf(stderr, "  Exactly matched reads: %ld (%.2f %%)\n", aux.n_matched_seqs, 100.0 * aux.n_matched_seqs / aux.n_sample_seqs);
 		fprintf(stderr, "  Unique reads:          %ld (%.2f %%)\n", aux.n_unique, 100.0 * aux.n_unique / aux.n_sample_seqs);
@@ -260,6 +323,9 @@ void process(const Option *opt, int n_sample, char *files[]) {
 		kseq_destroy(aux.ks);
 		gzclose(fp);
 	}
+
+	// Output repetitive reads with frequency
+	output(&aux);
 
 	delete fmi;
 	free(aux.em_counter);

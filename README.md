@@ -3,13 +3,13 @@
 
 *dupcnt* deduplicates reads in two steps.
 
-1. Pick out repetitive reads that exactly match to HG19/HG38 reference utilizing FM-index2. A 32-bit integer array is 
+1. Pick out repetitive reads that exactly match to HG19/HG38 reference utilizing FM-index2 (16GB). A 32-bit integer array is 
 used to count the occurrence of reads at each reference position, requiring 24G for human genome.
 2. A certain number of AVL trees are used to find duplications in the rest of unmatched reads. Specifically, reads in the tree 
 share the same first 6 bases, facilitating parallelism over 4096 trees. Two-bit encoded reads as nodes are inserted into the binary
 search trees, with each node occupying 40 plus (*read_length* / 4) bytes. For 6G reads length of 100bp (~200X), it needs < 400GB memory.
 Considering not exactly matched reads accounts for <50% of total reads, a medium-end server of 256GB RAM could be fitted in.
-it would be a better solution to obtain absolutely accurate results than previously used trie that cannot guarantee correctness 
+It is a better solution to obtain absolutely accurate results than previously used trie that cannot guarantee correctness 
 because of memory limitation.
 
 # Usage

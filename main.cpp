@@ -14,8 +14,8 @@ int usage() {
 	fprintf(stderr, "  -t <INT> Threads [16]\n");
 	fprintf(stderr ,"  -i <STR> Index prefix\n");
 	fprintf(stderr, "  -k <INT> Batch size\n");
-	fprintf(stderr, "  -c <STR> Trie memory usage upperbound [100G]\n");
-	fprintf(stderr, "  -j <INT> Output the most p frequent reads [0] (-1 to print all reads with occurrence number > 1)\n");
+	fprintf(stderr, "  -a       Output all reads to stdout\n");
+	fprintf(stderr, "  -s       Sort reads by frequency before output\n");
 	return 1;
 }
 
@@ -25,30 +25,20 @@ int main(int argc, char *argv[]) {
 	}
 	auto *opt = new Option();
 	int c;
-	while ((c = getopt(argc, argv, "t:i:k:c:j:h:")) >= 0) {
+	while ((c = getopt(argc, argv, "t:i:k:a:s:h:")) >= 0) {
 		if (c == 't') {
 			opt->n_threads = atoi(optarg);
 		} else if (c == 'i') {
 			opt->index_prefix = optarg;
 		} else if (c == 'k') {
 			opt->batch_size = atoi(optarg);
-		} else if (c == 'c') {
-			opt->mem_cap = 0;
-			for (int i = 0; optarg[i]; i++) {
-				if (optarg[i] >= '0' and optarg[i] <= '9') {
-					opt->mem_cap *= 10L;
-					opt->mem_cap += optarg[i] - '0';
-				} else if (optarg[i] == 'M' or optarg[i] == 'm') {
-					opt->mem_cap *= 1024L * 1024L;
-				} else if (optarg[i] == 'G' or optarg[i] == 'g') {
-					opt->mem_cap *= 1024L * 1024L * 1024L;
-				}
-			}
-		} else if (c == 'j') {
-			opt->most_rep = atol(optarg);
+		} else if (c == 'a') {
+			opt->output = true;
+		} else if (c == 's') {
+			opt->sorted = true;
 		} else {
 			fprintf(stderr, "Unrecognized option `-%c`\n", c);
-			free(opt);
+			delete opt;
 			return usage();
 		}
 	}
